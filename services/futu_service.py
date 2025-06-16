@@ -135,8 +135,15 @@ class FutuService:
             SubType.QUOTE: ft.SubType.QUOTE,
             SubType.ORDER_BOOK: ft.SubType.ORDER_BOOK,
             SubType.TICKER: ft.SubType.TICKER,
-            SubType.K_DAY: ft.SubType.K_DAY,
             SubType.K_1M: ft.SubType.K_1M,
+            SubType.K_3M: ft.SubType.K_3M,
+            SubType.K_5M: ft.SubType.K_5M,
+            SubType.K_15M: ft.SubType.K_15M,
+            SubType.K_30M: ft.SubType.K_30M,
+            SubType.K_60M: ft.SubType.K_60M,
+            SubType.K_DAY: ft.SubType.K_DAY,
+            SubType.K_WEEK: ft.SubType.K_WEEK,
+            SubType.K_MON: ft.SubType.K_MON,
             SubType.RT_DATA: ft.SubType.RT_DATA,
             SubType.BROKER: ft.SubType.BROKER
         }

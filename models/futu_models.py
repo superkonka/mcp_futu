@@ -47,8 +47,15 @@ class SubType(str, Enum):
     QUOTE = "QUOTE"           # 报价
     ORDER_BOOK = "ORDER_BOOK" # 摆盘
     TICKER = "TICKER"         # 逐笔
-    K_DAY = "K_DAY"          # 日K
     K_1M = "K_1M"            # 1分钟K线
+    K_3M = "K_3M"            # 3分钟K线
+    K_5M = "K_5M"            # 5分钟K线
+    K_15M = "K_15M"          # 15分钟K线
+    K_30M = "K_30M"          # 30分钟K线
+    K_60M = "K_60M"          # 60分钟K线
+    K_DAY = "K_DAY"          # 日K
+    K_WEEK = "K_WEEK"        # 周K
+    K_MON = "K_MON"          # 月K
     RT_DATA = "RT_DATA"       # 分时数据
     BROKER = "BROKER"         # 经纪队列
 

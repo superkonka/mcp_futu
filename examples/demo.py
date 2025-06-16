@@ -218,15 +218,29 @@ async def demo_subscribe():
     """演示订阅行情数据"""
     print("\n=== 订阅行情示例 ===")
     
-    # 订阅腾讯的报价和K线数据
+    # 订阅腾讯的报价和多种K线数据
     request_data = {
         "code_list": ["HK.00700"],
-        "subtype_list": ["QUOTE", "K_DAY"]
+        "subtype_list": ["QUOTE", "K_5M", "K_60M", "K_DAY"]  # 支持各种K线类型
     }
     
     result = await call_api("/quote/subscribe", request_data)
     print(f"请求参数: {json.dumps(request_data, indent=2)}")
     print(f"响应结果: {json.dumps(result, indent=2, ensure_ascii=False)}")
+    
+    # 演示所有支持的K线订阅类型
+    print("\n--- 支持的K线订阅类型示例 ---")
+    kline_subscribe = {
+        "code_list": ["HK.00700", "HK.09988"],
+        "subtype_list": [
+            "K_1M", "K_3M", "K_5M", "K_15M", "K_30M", "K_60M",  # 分钟K线
+            "K_DAY", "K_WEEK", "K_MON"  # 日周月K线
+        ]
+    }
+    
+    kline_result = await call_api("/quote/subscribe", kline_subscribe)
+    print(f"K线订阅请求: {json.dumps(kline_subscribe, indent=2)}")
+    print(f"K线订阅响应: {json.dumps(kline_result, indent=2, ensure_ascii=False)}")
 
 
 async def check_service_health():

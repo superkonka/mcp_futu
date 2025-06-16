@@ -31,7 +31,7 @@
 ## 🛠️ 技术架构
 
 ```
-AI 助手 (Claude/Cursor) 
+AI 助手 (Claude/Cursor/Cherry-Studio) 
     ↓ MCP 协议
 FastAPI MCP 服务
     ↓ 富途 Python SDK
