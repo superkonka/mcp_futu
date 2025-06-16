@@ -1,6 +1,7 @@
 # 富途 MCP API 服务
 
 基于 FastAPI 和 Model Context Protocol (MCP) 的富途证券行情 API 服务，将富途 OpenAPI 封装为 MCP 工具，支持 AI 助手直接调用富途行情数据。
+有个前提是必须自己安装好OpenD登陆好账号先
 
 ## 🚀 功能特性
 
