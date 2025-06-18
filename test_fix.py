@@ -1,72 +1,117 @@
 #!/usr/bin/env python3
-"""测试修复后的get_history_kline功能"""
+"""
+简化版技术指标API测试
+"""
 
-import asyncio
+from fastapi import FastAPI
+from pydantic import BaseModel
+from typing import Dict, Any, Optional, List
+import uvicorn
+from datetime import datetime, timedelta
 import sys
-from services.futu_service import FutuService
-from models.futu_models import HistoryKLineRequest, KLType, AuType
+import os
 
+# 添加项目路径
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-async def test_history_kline():
-    """测试历史K线功能"""
-    futu_service = FutuService()
-    
-    # 连接富途OpenD
-    connected = await futu_service.connect()
-    if not connected:
-        print("❌ 无法连接到富途OpenD")
-        return False
-    
-    print("✅ 富途OpenD连接成功")
-    
-    # 测试用例1：基本请求
-    print("\n📊 测试1: 获取腾讯(HK.00700)日K线...")
-    request1 = HistoryKLineRequest(
-        code="HK.00700",
-        ktype=KLType.K_DAY,
-        autype=AuType.QFQ,
-        max_count=10  # 只获取10条数据
-    )
+from analysis.technical_indicators import TechnicalIndicators, IndicatorConfig
+
+app = FastAPI(title="技术指标API测试", version="1.0.0")
+
+class SimpleIndicatorRequest(BaseModel):
+    code: str
+    period: int = 14
+    indicators: List[str] = ["macd", "rsi"]
+
+class SimpleIndicatorResponse(BaseModel):
+    code: str
+    period: int
+    indicators: Dict[str, Any]
+    timestamp: str
+
+@app.post("/test/indicators")
+async def test_indicators(request: SimpleIndicatorRequest):
+    """测试技术指标计算"""
     
     try:
-        result1 = await futu_service.get_history_kline(request1)
-        if result1.ret_code == 0:
-            print(f"✅ 成功获取 {len(result1.data['kline_data'])} 条K线数据")
-            if result1.data['kline_data']:
-                print(f"📅 最新数据时间: {result1.data['kline_data'][-1]['time_key']}")
-        else:
-            print(f"❌ 获取失败: {result1.ret_msg}")
+        # 创建模拟K线数据
+        kline_data = []
+        base_price = 54.0
+        
+        for i in range(30):
+            price = base_price + (i % 10 - 5) * 0.5
+            kline_data.append({
+                "time": (datetime.now() - timedelta(days=29-i)).strftime('%Y-%m-%d'),
+                "open": price - 0.1,
+                "high": price + 0.3,
+                "low": price - 0.2,
+                "close": price,
+                "volume": 1000000 + (i % 5) * 100000,
+                "turnover": price * 1000000
+            })
+        
+        # 计算技术指标
+        config = IndicatorConfig()
+        technical_data = TechnicalIndicators.from_kline_data(kline_data, config)
+        indicators = technical_data.calculate_all_indicators()
+        
+        # 简化返回数据，只返回安全的部分
+        simplified_indicators = {}
+        
+        if "trend_indicators" in indicators:
+            trend = indicators["trend_indicators"]
+            simplified_indicators["trend"] = {}
+            
+            # MACD - 只返回有效数值
+            if "macd" in trend and "current" in trend["macd"]:
+                macd_current = trend["macd"]["current"]
+                simplified_indicators["trend"]["macd"] = {
+                    k: v for k, v in macd_current.items() 
+                    if v is not None and isinstance(v, (int, float))
+                }
+            
+            # 移动平均线 - 只返回有效数值
+            if "moving_averages" in trend and "current" in trend["moving_averages"]:
+                ma_current = trend["moving_averages"]["current"]
+                simplified_indicators["trend"]["moving_averages"] = {
+                    k: v for k, v in ma_current.items() 
+                    if v is not None and isinstance(v, (int, float))
+                }
+        
+        if "momentum_indicators" in indicators:
+            momentum = indicators["momentum_indicators"]
+            simplified_indicators["momentum"] = {}
+            
+            # RSI
+            if "rsi" in momentum and "current" in momentum["rsi"]:
+                rsi_current = momentum["rsi"]["current"]
+                if rsi_current is not None and isinstance(rsi_current, (int, float)):
+                    simplified_indicators["momentum"]["rsi"] = rsi_current
+        
+        response = SimpleIndicatorResponse(
+            code=request.code,
+            period=request.period,
+            indicators=simplified_indicators,
+            timestamp=datetime.now().isoformat()
+        )
+        
+        return {
+            "ret_code": 0,
+            "ret_msg": "技术指标计算成功",
+            "data": response.model_dump()
+        }
+        
     except Exception as e:
-        print(f"❌ 异常: {str(e)}")
-    
-    # 测试用例2：带日期范围的请求
-    print("\n📊 测试2: 获取苹果(US.AAPL)指定日期范围的日K线...")
-    request2 = HistoryKLineRequest(
-        code="US.AAPL",
-        start="2024-01-01",
-        end="2024-01-31",
-        ktype=KLType.K_DAY,
-        autype=AuType.QFQ,
-        max_count=50
-    )
-    
-    try:
-        result2 = await futu_service.get_history_kline(request2)
-        if result2.ret_code == 0:
-            print(f"✅ 成功获取 {len(result2.data['kline_data'])} 条K线数据")
-        else:
-            print(f"❌ 获取失败: {result2.ret_msg}")
-    except Exception as e:
-        print(f"❌ 异常: {str(e)}")
-    
-    # 断开连接
-    await futu_service.disconnect()
-    print("\n🔌 已断开富途OpenD连接")
-    
-    return True
+        return {
+            "ret_code": -1,
+            "ret_msg": f"计算失败: {str(e)}",
+            "data": None
+        }
 
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
 
 if __name__ == "__main__":
-    print("🚀 开始测试历史K线功能修复...")
-    asyncio.run(test_history_kline())
-    print("✅ 测试完成！") 
+    print("🚀 启动技术指标测试服务...")
+    uvicorn.run(app, host="0.0.0.0", port=8003, reload=True) 

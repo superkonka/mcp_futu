@@ -1,0 +1,23 @@
+# 原有依赖
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+pydantic>=2.4.0
+loguru>=0.7.2
+futu-api>=9.0.0
+
+# 缓存相关
+redis>=5.0.0
+# sqlite3 是Python内置模块，无需安装
+
+# 数据处理
+pandas>=2.0.0
+numpy>=1.24.0
+
+# 技术分析（可选 - 如果安装失败可以跳过，系统会自动使用纯Python实现）
+# TA-Lib>=0.4.26  # 需要额外编译，在macOS上可能需要: brew install ta-lib
+# 如果安装TA-Lib有问题，可以注释掉，会自动使用纯Python实现
+
+# 开发依赖（可选）
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
+httpx>=0.25.0 
