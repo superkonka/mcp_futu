@@ -55,6 +55,8 @@ async def lifespan(app: FastAPI):
         
         # 初始化富途服务
         futu_service = FutuService()
+        # 设置缓存管理器
+        futu_service.cache_manager = cache_manager
         
         # 尝试连接富途OpenD
         if await futu_service.connect():
@@ -73,6 +75,7 @@ async def lifespan(app: FastAPI):
         
     except Exception as e:
         logger.error(f"❌ 服务启动失败: {e}")
+        logger.exception("详细错误信息:")
         raise
     finally:
         # 清理资源
@@ -113,6 +116,132 @@ async def health_check():
         "timestamp": datetime.now().isoformat(),
         "cache_stats": cache_stats
     }
+
+
+# ==================== 时间相关接口 ====================
+@app.get("/api/time/current",
+         operation_id="get_current_time",
+         summary="获取当前时间",
+         description="获取服务器当前时间，用于LLM理解时间上下文和模糊时间表达")
+async def get_current_time() -> Dict[str, Any]:
+    """获取当前时间信息，帮助LLM理解模糊时间表达"""
+    now = datetime.now()
+    
+    # 计算一些常用的时间点
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    yesterday_start = today_start - timedelta(days=1)
+    week_start = today_start - timedelta(days=now.weekday())  # 本周一
+    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    
+    # 股市相关时间（港股为例）
+    market_open_today = now.replace(hour=9, minute=30, second=0, microsecond=0)
+    market_close_today = now.replace(hour=16, minute=0, second=0, microsecond=0)
+    
+    # 判断是否在交易时间
+    is_trading_hours = False
+    if now.weekday() < 5:  # 周一到周五
+        morning_session = (now.replace(hour=9, minute=30) <= now <= now.replace(hour=12, minute=0))
+        afternoon_session = (now.replace(hour=13, minute=0) <= now <= now.replace(hour=16, minute=0))
+        is_trading_hours = morning_session or afternoon_session
+    
+    # 生成时间上下文信息
+    time_contexts = {
+        "今天": today_start.strftime("%Y-%m-%d"),
+        "昨天": yesterday_start.strftime("%Y-%m-%d"),
+        "本周": week_start.strftime("%Y-%m-%d"),
+        "本月": month_start.strftime("%Y-%m-%d"),
+        "近期": (now - timedelta(days=7)).strftime("%Y-%m-%d"),  # 最近7天
+        "最近": (now - timedelta(days=3)).strftime("%Y-%m-%d"),  # 最近3天
+        "这几天": (now - timedelta(days=5)).strftime("%Y-%m-%d"),  # 最近5天
+        "上周": (week_start - timedelta(days=7)).strftime("%Y-%m-%d"),
+        "上月": (month_start - timedelta(days=1)).replace(day=1).strftime("%Y-%m-%d"),
+        "最近一个月": (now - timedelta(days=30)).strftime("%Y-%m-%d"),
+        "最近三个月": (now - timedelta(days=90)).strftime("%Y-%m-%d")
+    }
+    
+    return {
+        "ret_code": 0,
+        "ret_msg": "获取当前时间成功",
+        "data": {
+            # 基础时间信息
+            "current_time": now.isoformat(),
+            "current_date": now.strftime("%Y-%m-%d"),
+            "current_datetime": now.strftime("%Y-%m-%d %H:%M:%S"),
+            "timestamp": int(now.timestamp()),
+            
+            # 格式化时间
+            "formatted": {
+                "iso": now.isoformat(),
+                "chinese": now.strftime("%Y年%m月%d日 %H:%M:%S"),
+                "date_only": now.strftime("%Y-%m-%d"),
+                "time_only": now.strftime("%H:%M:%S"),
+                "weekday": now.strftime("%A"),
+                "weekday_chinese": ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][now.weekday()]
+            },
+            
+            # 市场时间信息
+            "market": {
+                "is_trading_day": now.weekday() < 5,
+                "is_trading_hours": is_trading_hours,
+                "market_open_time": market_open_today.strftime("%H:%M"),
+                "market_close_time": market_close_today.strftime("%H:%M"),
+                "next_trading_day": _get_next_trading_day(now).strftime("%Y-%m-%d")
+            },
+            
+            # 时间上下文映射（用于模糊时间理解）
+            "time_contexts": time_contexts,
+            
+            # 时间区间建议
+            "common_periods": {
+                "最近1天": {
+                    "start": (now - timedelta(days=1)).strftime("%Y-%m-%d"),
+                    "end": now.strftime("%Y-%m-%d")
+                },
+                "最近3天": {
+                    "start": (now - timedelta(days=3)).strftime("%Y-%m-%d"),
+                    "end": now.strftime("%Y-%m-%d")
+                },
+                "最近1周": {
+                    "start": (now - timedelta(days=7)).strftime("%Y-%m-%d"),
+                    "end": now.strftime("%Y-%m-%d")
+                },
+                "最近1月": {
+                    "start": (now - timedelta(days=30)).strftime("%Y-%m-%d"),
+                    "end": now.strftime("%Y-%m-%d")
+                },
+                "最近3月": {
+                    "start": (now - timedelta(days=90)).strftime("%Y-%m-%d"),
+                    "end": now.strftime("%Y-%m-%d")
+                },
+                "年初至今": {
+                    "start": now.replace(month=1, day=1).strftime("%Y-%m-%d"),
+                    "end": now.strftime("%Y-%m-%d")
+                }
+            },
+            
+            # LLM提示信息
+            "llm_context": {
+                "description": "当前服务器时间信息，用于理解用户的模糊时间表达",
+                "usage_examples": [
+                    "当用户说'最近'时，通常指最近3天",
+                    "当用户说'近期'时，通常指最近1周", 
+                    "当用户说'这几天'时，通常指最近5天",
+                    "股票数据分析建议使用交易日时间范围"
+                ]
+            }
+        }
+    }
+
+
+def _get_next_trading_day(current_time: datetime) -> datetime:
+    """计算下一个交易日"""
+    next_day = current_time + timedelta(days=1)
+    
+    # 跳过周末
+    while next_day.weekday() >= 5:  # 周六=5, 周日=6
+        next_day += timedelta(days=1)
+    
+    return next_day
 
 
 # ==================== 原有行情接口（增强版） ====================
@@ -823,18 +952,101 @@ async def get_stock_basicinfo(request: StockBasicInfoRequest) -> APIResponse:
 
 
 @app.post("/api/quote/subscribe", 
-          operation_id="subscribe_quotes",
-          summary="订阅行情数据")
-async def subscribe_quotes(request: SubscribeRequest) -> APIResponse:
-    """订阅行情数据"""
+          operation_id="subscribe_quotes_deprecated",
+          summary="⚠️ 已弃用：订阅功能（MCP不支持）",
+          deprecated=True)
+async def subscribe_quotes_deprecated(request: SubscribeRequest) -> APIResponse:
+    """
+    ⚠️ 已弃用：订阅功能不适合MCP协议
+    
+    MCP是单次同步请求-响应模式，不支持长连接和回调推送。
+    
+    建议使用以下替代接口：
+    - POST /api/quote/stock_quote - 获取实时报价
+    - POST /api/quote/order_book - 获取实时摆盘  
+    - POST /api/quote/rt_ticker - 获取实时逐笔
+    - POST /api/quote/rt_data - 获取实时分时
+    - POST /api/quote/current_kline - 获取实时K线
+    """
+    return APIResponse(
+        ret_code=-1, 
+        ret_msg="⚠️ 订阅功能已弃用。MCP协议不支持长连接推送。请使用对应的get_*接口直接拉取实时数据。", 
+        data={
+            "alternative_endpoints": [
+                "/api/quote/stock_quote - 获取实时报价",
+                "/api/quote/order_book - 获取实时摆盘",
+                "/api/quote/rt_ticker - 获取实时逐笔", 
+                "/api/quote/rt_data - 获取实时分时",
+                "/api/quote/current_kline - 获取实时K线"
+            ]
+        }
+    )
+
+
+# ==================== MCP专用增强拉取接口 ====================
+
+@app.post("/api/quote/realtime_quote_enhanced",
+          operation_id="get_realtime_quote_enhanced",
+          summary="🚀 MCP专用：增强实时报价拉取",
+          description="专为MCP设计的实时报价接口，支持批量获取，无需订阅，直接拉取最新数据")
+async def get_realtime_quote_enhanced(request: RealtimeQuoteEnhancedRequest) -> APIResponse:
+    """MCP专用：增强实时报价拉取"""
     if not _server_ready:
         return APIResponse(ret_code=-1, ret_msg="服务器正在初始化中，请稍后重试", data=None)
     
     try:
-        return await futu_service.subscribe(request)
+        return await futu_service.get_realtime_quote_enhanced(request.codes, request.fields)
     except Exception as e:
-        logger.error(f"订阅行情数据失败: {e}")
-        return APIResponse(ret_code=-1, ret_msg=f"订阅行情数据失败: {e}", data=None)
+        logger.error(f"获取增强实时报价失败: {e}")
+        return APIResponse(ret_code=-1, ret_msg=f"获取增强实时报价失败: {e}", data=None)
+
+
+@app.post("/api/quote/realtime_orderbook_enhanced",
+          operation_id="get_realtime_orderbook_enhanced",
+          summary="🚀 MCP专用：增强实时摆盘拉取",
+          description="专为MCP设计的实时摆盘接口，无需订阅，直接拉取买卖盘口数据")
+async def get_realtime_orderbook_enhanced(request: RealtimeOrderBookEnhancedRequest) -> APIResponse:
+    """MCP专用：增强实时摆盘拉取"""
+    if not _server_ready:
+        return APIResponse(ret_code=-1, ret_msg="服务器正在初始化中，请稍后重试", data=None)
+    
+    try:
+        return await futu_service.get_realtime_orderbook_enhanced(request.code, request.num)
+    except Exception as e:
+        logger.error(f"获取增强实时摆盘失败: {e}")
+        return APIResponse(ret_code=-1, ret_msg=f"获取增强实时摆盘失败: {e}", data=None)
+
+
+@app.post("/api/quote/realtime_ticker_enhanced",
+          operation_id="get_realtime_ticker_enhanced",
+          summary="🚀 MCP专用：增强实时逐笔拉取",
+          description="专为MCP设计的实时逐笔接口，无需订阅，直接拉取最新成交数据")
+async def get_realtime_ticker_enhanced(request: RealtimeTickerEnhancedRequest) -> APIResponse:
+    """MCP专用：增强实时逐笔拉取"""
+    if not _server_ready:
+        return APIResponse(ret_code=-1, ret_msg="服务器正在初始化中，请稍后重试", data=None)
+    
+    try:
+        return await futu_service.get_realtime_ticker_enhanced(request.code, request.num)
+    except Exception as e:
+        logger.error(f"获取增强实时逐笔失败: {e}")
+        return APIResponse(ret_code=-1, ret_msg=f"获取增强实时逐笔失败: {e}", data=None)
+
+
+@app.post("/api/quote/realtime_data_enhanced",
+          operation_id="get_realtime_data_enhanced",
+          summary="🚀 MCP专用：增强实时分时拉取",
+          description="专为MCP设计的实时分时接口，无需订阅，直接拉取分时走势数据")
+async def get_realtime_data_enhanced(request: RealtimeDataEnhancedRequest) -> APIResponse:
+    """MCP专用：增强实时分时拉取"""
+    if not _server_ready:
+        return APIResponse(ret_code=-1, ret_msg="服务器正在初始化中，请稍后重试", data=None)
+    
+    try:
+        return await futu_service.get_realtime_data_enhanced(request.code)
+    except Exception as e:
+        logger.error(f"获取增强实时分时失败: {e}")
+        return APIResponse(ret_code=-1, ret_msg=f"获取增强实时分时失败: {e}", data=None)
 
 
 # ==================== 启动配置 ====================

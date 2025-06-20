@@ -5,14 +5,26 @@ from loguru import logger
 from config import settings
 from models.futu_models import *
 import base64
+import asyncio
+import time
 
 
 class FutuService:
     """富途API服务类"""
     
     def __init__(self):
-        self.quote_ctx: Optional[ft.OpenQuoteContext] = None
-        self.is_connected = False
+        """初始化富途服务"""
+        self.quote_ctx = None
+        self.trade_ctx = None
+        self.cache_manager = None  # 将在外部设置
+        
+        # === 订阅状态管理 ===
+        self._subscription_status = {}  # 记录订阅状态 {code: {subtype: True/False}}
+        self._subscription_lock = asyncio.Lock()  # 防止并发订阅冲突
+        self._subscription_data_cache = {}  # 订阅数据临时缓存
+        self._last_subscription_time = {}  # 上次订阅时间，用于清理
+        
+        logger.info("富途服务初始化")
         
         # 定义各种数据类型的有效字段集合
         self.ESSENTIAL_FIELDS = {
@@ -60,7 +72,6 @@ class FutuService:
             # 测试连接
             ret, data = self.quote_ctx.get_global_state()
             if ret == ft.RET_OK:
-                self.is_connected = True
                 logger.info(f"成功连接到富途OpenD: {settings.futu_host}:{settings.futu_port}")
                 return True
             else:
@@ -75,12 +86,11 @@ class FutuService:
         """断开连接"""
         if self.quote_ctx:
             self.quote_ctx.close()
-            self.is_connected = False
             logger.info("已断开富途OpenD连接")
     
     def _check_connection(self):
         """检查连接状态"""
-        if not self.is_connected or not self.quote_ctx:
+        if not self.quote_ctx:
             raise Exception("富途OpenD未连接")
     
     def _convert_market(self, market: Market) -> ft.Market:
@@ -129,25 +139,16 @@ class FutuService:
         }
         return au_map.get(au_type, ft.AuType.QFQ)
     
-    def _convert_sub_type(self, sub_type: SubType) -> ft.SubType:
-        """转换订阅类型"""
-        sub_map = {
-            SubType.QUOTE: ft.SubType.QUOTE,
-            SubType.ORDER_BOOK: ft.SubType.ORDER_BOOK,
-            SubType.TICKER: ft.SubType.TICKER,
-            SubType.K_1M: ft.SubType.K_1M,
-            SubType.K_3M: ft.SubType.K_3M,
-            SubType.K_5M: ft.SubType.K_5M,
-            SubType.K_15M: ft.SubType.K_15M,
-            SubType.K_30M: ft.SubType.K_30M,
-            SubType.K_60M: ft.SubType.K_60M,
-            SubType.K_DAY: ft.SubType.K_DAY,
-            SubType.K_WEEK: ft.SubType.K_WEEK,
-            SubType.K_MON: ft.SubType.K_MON,
-            SubType.RT_DATA: ft.SubType.RT_DATA,
-            SubType.BROKER: ft.SubType.BROKER
+    def _convert_sub_type(self, sub_type: str):
+        """将内部订阅类型转换为富途API订阅类型"""
+        subtype_mapping = {
+            'ORDER_BOOK': ft.SubType.ORDER_BOOK,
+            'TICKER': ft.SubType.TICKER,
+            'RT_DATA': ft.SubType.RT_DATA,
+            'QUOTE': ft.SubType.QUOTE,
+            'BROKER': ft.SubType.BROKER
         }
-        return sub_map.get(sub_type, ft.SubType.QUOTE)
+        return subtype_mapping.get(sub_type)
     
     def _calculate_days_back(self, ktype: KLType, max_count: int) -> int:
         """根据K线类型和数据量计算需要往前推的天数"""
@@ -479,33 +480,34 @@ class FutuService:
             )
     
     async def subscribe(self, request: SubscribeRequest) -> APIResponse:
-        """订阅数据"""
-        self._check_connection()
+        """
+        ⚠️ 已弃用：订阅功能不适合MCP协议
         
-        try:
-            subtype_list = [self._convert_sub_type(sub) for sub in request.subtype_list]
-            ret, err_message = self.quote_ctx.subscribe(request.code_list, subtype_list)
-            
-            if ret == ft.RET_OK:
-                return APIResponse(
-                    ret_code=0,
-                    ret_msg="订阅成功",
-                    data={"subscribed_codes": request.code_list}
-                )
-            else:
-                return APIResponse(
-                    ret_code=ret,
-                    ret_msg=f"订阅失败: {err_message}",
-                    data=None
-                )
-                
-        except Exception as e:
-            logger.error(f"订阅异常: {str(e)}")
-            return APIResponse(
-                ret_code=-1,
-                ret_msg=f"订阅异常: {str(e)}",
-                data=None
-            )
+        MCP是单次同步请求-响应模式，不支持长连接和回调推送。
+        订阅功能需要持续的数据推送，与MCP架构不匹配。
+        
+        建议替代方案：
+        - 使用 get_stock_quote() 获取实时报价
+        - 使用 get_order_book() 获取实时摆盘  
+        - 使用 get_rt_ticker() 获取实时逐笔
+        - 使用 get_rt_data() 获取实时分时
+        - 使用 get_current_kline() 获取实时K线
+        
+        这些接口无需订阅，可直接拉取最新数据。
+        """
+        return APIResponse(
+            ret_code=-1,
+            ret_msg="订阅功能已弃用。MCP协议不支持长连接推送。请使用对应的get_*接口直接拉取实时数据。",
+            data={
+                "alternative_apis": [
+                    "get_stock_quote - 获取实时报价",
+                    "get_order_book - 获取实时摆盘",
+                    "get_rt_ticker - 获取实时逐笔", 
+                    "get_rt_data - 获取实时分时",
+                    "get_current_kline - 获取实时K线"
+                ]
+            }
+        )
     
     async def get_order_book(self, request: OrderBookRequest) -> APIResponse:
         """获取摆盘数据"""
@@ -625,4 +627,305 @@ class FutuService:
                 ret_code=-1,
                 ret_msg=f"获取交易日异常: {str(e)}",
                 data=None
-            ) 
+            )
+    
+    # === MCP专用增强拉取接口 ===
+    
+    async def get_realtime_quote_enhanced(self, codes: List[str], fields: Optional[List[str]] = None) -> APIResponse:
+        """
+        MCP专用：增强实时报价拉取
+        
+        与订阅模式不同，这是主动拉取最新数据，适合MCP单次请求场景。
+        支持批量获取多只股票的实时报价。
+        """
+        self._check_connection()
+        
+        try:
+            ret, data = self.quote_ctx.get_market_snapshot(codes)
+            
+            if ret == ft.RET_OK:
+                # 使用数据优化
+                optimization = DataOptimization(
+                    only_essential_fields=True,
+                    custom_fields=fields
+                )
+                result = self._dataframe_to_dict(data, 'quote', optimization)
+                
+                return APIResponse(
+                    ret_code=0,
+                    ret_msg=f"成功获取{len(codes)}只股票实时报价",
+                    data={
+                        "quotes": result, 
+                        "data_count": len(result),
+                        "timestamp": pd.Timestamp.now().isoformat(),
+                        "codes_requested": codes
+                    }
+                )
+            else:
+                return APIResponse(
+                    ret_code=ret,
+                    ret_msg=f"获取实时报价失败: {data}",
+                    data=None
+                )
+                
+        except Exception as e:
+            logger.error(f"获取增强实时报价异常: {str(e)}")
+            return APIResponse(
+                ret_code=-1,
+                ret_msg=f"获取增强实时报价异常: {str(e)}",
+                data=None
+            )
+    
+    async def get_realtime_orderbook_enhanced(self, code: str, num: int = 10) -> APIResponse:
+        """
+        MCP专用：增强实时摆盘拉取
+        
+        🧠 智能订阅管理：
+        1. 内部自动检查并确保OrderBook数据已订阅
+        2. 订阅成功后获取最新摆盘数据
+        3. 对外保持同步接口，用户无需关心订阅细节
+        4. 自动清理过期订阅，避免资源浪费
+        """
+        self._check_connection()
+        
+        try:
+            # 🧠 智能订阅管理：确保OrderBook数据已订阅
+            logger.info(f"正在确保 {code} 的OrderBook数据已订阅...")
+            subscription_success = await self._ensure_subscription(code, 'ORDER_BOOK')
+            
+            if not subscription_success:
+                return APIResponse(
+                    ret_code=-1,
+                    ret_msg=f"无法订阅{code}的OrderBook数据，请检查股票代码或网络连接",
+                    data=None
+                )
+            
+            # 🔄 清理过期订阅（后台任务，不阻塞当前请求）
+            asyncio.create_task(self._cleanup_old_subscriptions())
+            
+            # 📊 获取摆盘数据
+            ret, data = self.quote_ctx.get_order_book(code, num=num)
+            
+            if ret == ft.RET_OK:
+                result = self._dataframe_to_dict(data, 'order_book', DataOptimization())
+                
+                return APIResponse(
+                    ret_code=0,
+                    ret_msg=f"✅ 成功获取{code}实时摆盘（已自动订阅，档位数：{num}）",
+                    data={
+                        "order_book": result,
+                        "code": code,
+                        "levels": num,
+                        "subscribed": True,
+                        "timestamp": pd.Timestamp.now().isoformat()
+                    }
+                )
+            else:
+                return APIResponse(
+                    ret_code=ret,
+                    ret_msg=f"获取实时摆盘失败: {data}",
+                    data=None
+                )
+                
+        except Exception as e:
+            logger.error(f"获取增强实时摆盘异常: {str(e)}")
+            return APIResponse(
+                ret_code=-1,
+                ret_msg=f"获取增强实时摆盘异常: {str(e)}",
+                data=None
+            )
+    
+    async def get_realtime_ticker_enhanced(self, code: str, num: int = 100) -> APIResponse:
+        """
+        MCP专用：增强实时逐笔拉取
+        
+        🧠 智能订阅管理：自动订阅TICKER数据，然后获取实时逐笔成交。
+        """
+        self._check_connection()
+        
+        try:
+            # 🧠 智能订阅管理：确保TICKER数据已订阅
+            logger.info(f"正在确保 {code} 的TICKER数据已订阅...")
+            subscription_success = await self._ensure_subscription(code, 'TICKER')
+            
+            if not subscription_success:
+                return APIResponse(
+                    ret_code=-1,
+                    ret_msg=f"无法订阅{code}的TICKER数据，请检查股票代码或网络连接",
+                    data=None
+                )
+            
+            # 🔄 清理过期订阅
+            asyncio.create_task(self._cleanup_old_subscriptions())
+            
+            # 📊 获取逐笔数据
+            ret, data = self.quote_ctx.get_rt_ticker(code, num=num)
+            
+            if ret == ft.RET_OK:
+                result = self._dataframe_to_dict(data, 'ticker', DataOptimization())
+                
+                return APIResponse(
+                    ret_code=0,
+                    ret_msg=f"✅ 成功获取{code}实时逐笔（已自动订阅，条数：{num}）",
+                    data={
+                        "ticker_data": result,
+                        "code": code,
+                        "count": len(result),
+                        "subscribed": True,
+                        "timestamp": pd.Timestamp.now().isoformat()
+                    }
+                )
+            else:
+                return APIResponse(
+                    ret_code=ret,
+                    ret_msg=f"获取实时逐笔失败: {data}",
+                    data=None
+                )
+                
+        except Exception as e:
+            logger.error(f"获取增强实时逐笔异常: {str(e)}")
+            return APIResponse(
+                ret_code=-1,
+                ret_msg=f"获取增强实时逐笔异常: {str(e)}",
+                data=None
+            )
+    
+    async def get_realtime_data_enhanced(self, code: str) -> APIResponse:
+        """
+        MCP专用：增强实时分时拉取
+        
+        🧠 智能订阅管理：自动订阅RT_DATA数据，然后获取实时分时走势。
+        """
+        self._check_connection()
+        
+        try:
+            # 🧠 智能订阅管理：确保RT_DATA数据已订阅
+            logger.info(f"正在确保 {code} 的RT_DATA数据已订阅...")
+            subscription_success = await self._ensure_subscription(code, 'RT_DATA')
+            
+            if not subscription_success:
+                return APIResponse(
+                    ret_code=-1,
+                    ret_msg=f"无法订阅{code}的RT_DATA数据，请检查股票代码或网络连接",
+                    data=None
+                )
+            
+            # 🔄 清理过期订阅
+            asyncio.create_task(self._cleanup_old_subscriptions())
+            
+            # 📊 获取分时数据
+            ret, data = self.quote_ctx.get_rt_data(code)
+            
+            if ret == ft.RET_OK:
+                result = self._dataframe_to_dict(data, 'rt_data', DataOptimization())
+                
+                return APIResponse(
+                    ret_code=0,
+                    ret_msg=f"✅ 成功获取{code}实时分时（已自动订阅，数据点：{len(result)}）",
+                    data={
+                        "rt_data": result,
+                        "code": code,
+                        "data_points": len(result),
+                        "subscribed": True,
+                        "timestamp": pd.Timestamp.now().isoformat()
+                    }
+                )
+            else:
+                return APIResponse(
+                    ret_code=ret,
+                    ret_msg=f"获取实时分时失败: {data}",
+                    data=None
+                )
+                
+        except Exception as e:
+            logger.error(f"获取增强实时分时异常: {str(e)}")
+            return APIResponse(
+                ret_code=-1,
+                ret_msg=f"获取增强实时分时异常: {str(e)}",
+                data=None
+            )
+    
+    # === 智能订阅管理 ===
+    
+    async def _ensure_subscription(self, code: str, subtype: str, timeout: float = 3.0) -> bool:
+        """
+        确保指定股票的指定类型数据已订阅
+        
+        Args:
+            code: 股票代码，如 'HK.00700'
+            subtype: 订阅类型，如 'ORDER_BOOK', 'TICKER', 'RT_DATA'
+            timeout: 等待订阅完成的超时时间（秒）
+            
+        Returns:
+            bool: 订阅是否成功
+        """
+        async with self._subscription_lock:
+            # 检查是否已经订阅
+            if self._is_subscribed(code, subtype):
+                logger.debug(f"股票 {code} 的 {subtype} 已经订阅，跳过")
+                return True
+            
+            try:
+                self._check_connection()
+                
+                # 根据subtype确定订阅类型
+                futu_subtype = self._convert_sub_type(subtype)
+                if not futu_subtype:
+                    logger.error(f"不支持的订阅类型: {subtype}")
+                    return False
+                
+                # 执行订阅
+                ret, err_message = self.quote_ctx.subscribe(code, [futu_subtype])
+                
+                if ret == ft.RET_OK:
+                    # 记录订阅状态
+                    if code not in self._subscription_status:
+                        self._subscription_status[code] = {}
+                    self._subscription_status[code][subtype] = True
+                    self._last_subscription_time[f"{code}_{subtype}"] = time.time()
+                    
+                    logger.info(f"成功订阅 {code} 的 {subtype} 数据")
+                    
+                    # 等待订阅生效（重要！）
+                    await asyncio.sleep(0.5)
+                    return True
+                else:
+                    logger.error(f"订阅失败: {code} {subtype} - {err_message}")
+                    return False
+                    
+            except Exception as e:
+                logger.error(f"订阅异常: {code} {subtype} - {str(e)}")
+                return False
+    
+    def _is_subscribed(self, code: str, subtype: str) -> bool:
+        """检查是否已订阅指定数据"""
+        return (code in self._subscription_status and 
+                subtype in self._subscription_status[code] and 
+                self._subscription_status[code][subtype])
+    
+    async def _cleanup_old_subscriptions(self, max_age: int = 300):
+        """清理超过指定时间的订阅（5分钟）"""
+        current_time = time.time()
+        to_remove = []
+        
+        for key, sub_time in self._last_subscription_time.items():
+            if current_time - sub_time > max_age:
+                to_remove.append(key)
+        
+        for key in to_remove:
+            try:
+                code, subtype = key.split('_', 1)
+                futu_subtype = self._convert_sub_type(subtype)
+                
+                if futu_subtype:
+                    self.quote_ctx.unsubscribe(code, [futu_subtype])
+                    
+                    # 清理状态记录
+                    if code in self._subscription_status and subtype in self._subscription_status[code]:
+                        del self._subscription_status[code][subtype]
+                    del self._last_subscription_time[key]
+                    
+                    logger.info(f"清理过期订阅: {code} {subtype}")
+                    
+            except Exception as e:
+                logger.warning(f"清理订阅失败: {key} - {str(e)}") 
