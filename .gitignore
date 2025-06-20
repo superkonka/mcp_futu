@@ -1,0 +1,18 @@
+# Python缓存文件
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 数据库文件
+*.db
+data/
+
+# 日志文件
+*.log
+logs/
+
+# 环境文件
+.env
+venv/
+.venv/

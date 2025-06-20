@@ -238,7 +238,15 @@ class FutuService:
     def _dataframe_to_dict(self, df: pd.DataFrame, field_type: str = 'default',
                           optimization_config = None) -> List[Dict[str, Any]]:
         """将DataFrame转换为字典列表，支持数据优化"""
-        if df is None or df.empty:
+        if df is None:
+            return []
+        
+        # 检查输入是否是DataFrame
+        if not isinstance(df, pd.DataFrame):
+            logger.warning(f"_dataframe_to_dict接收到非DataFrame数据: {type(df)}, 内容: {df}")
+            return []
+            
+        if df.empty:
             return []
         
         # 处理NaN值 - 先用空字符串填充，然后在后续处理中转换为None
@@ -261,6 +269,41 @@ class FutuService:
                     record = self._filter_fields(record, field_type, requested_fields)
             
             result.append(record)
+        
+        return result
+    
+    def _orderbook_dict_to_list(self, orderbook_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """将摆盘dict数据转换为列表格式，便于处理"""
+        if not isinstance(orderbook_data, dict):
+            return []
+        
+        result = []
+        
+        # 处理买盘数据
+        if 'Bid' in orderbook_data:
+            for i, bid in enumerate(orderbook_data['Bid']):
+                price, volume, order_count, broker_info = bid
+                result.append({
+                    'type': 'bid',
+                    'level': i + 1,
+                    'price': price,
+                    'volume': volume,
+                    'order_count': order_count,
+                    'broker_info': broker_info
+                })
+        
+        # 处理卖盘数据
+        if 'Ask' in orderbook_data:
+            for i, ask in enumerate(orderbook_data['Ask']):
+                price, volume, order_count, broker_info = ask
+                result.append({
+                    'type': 'ask',
+                    'level': i + 1,
+                    'price': price,
+                    'volume': volume,
+                    'order_count': order_count,
+                    'broker_info': broker_info
+                })
         
         return result
         
@@ -707,19 +750,45 @@ class FutuService:
             ret, data = self.quote_ctx.get_order_book(code, num=num)
             
             if ret == ft.RET_OK:
-                result = self._dataframe_to_dict(data, 'order_book', DataOptimization())
-                
-                return APIResponse(
-                    ret_code=0,
-                    ret_msg=f"✅ 成功获取{code}实时摆盘（已自动订阅，档位数：{num}）",
-                    data={
-                        "order_book": result,
-                        "code": code,
-                        "levels": num,
-                        "subscribed": True,
-                        "timestamp": pd.Timestamp.now().isoformat()
-                    }
-                )
+                # 摆盘数据返回的是dict格式，不是DataFrame
+                if isinstance(data, dict):
+                    # 处理摆盘dict数据
+                    result_list = self._orderbook_dict_to_list(data)
+                    
+                    return APIResponse(
+                        ret_code=0,
+                        ret_msg=f"✅ 成功获取{code}实时摆盘（已自动订阅，档位数：{num}）",
+                        data={
+                            "order_book_raw": data,  # 原始dict数据
+                            "order_book_formatted": result_list,  # 格式化后的列表数据
+                            "code": code,
+                            "levels": num,
+                            "subscribed": True,
+                            "timestamp": pd.Timestamp.now().isoformat()
+                        }
+                    )
+                elif isinstance(data, pd.DataFrame):
+                    # 如果是DataFrame，使用原来的处理方式
+                    result = self._dataframe_to_dict(data, 'order_book', DataOptimization())
+                    
+                    return APIResponse(
+                        ret_code=0,
+                        ret_msg=f"✅ 成功获取{code}实时摆盘（已自动订阅，档位数：{num}）",
+                        data={
+                            "order_book": result,
+                            "code": code,
+                            "levels": num,
+                            "subscribed": True,
+                            "timestamp": pd.Timestamp.now().isoformat()
+                        }
+                    )
+                else:
+                    logger.error(f"获取摆盘数据返回未知格式: {type(data)}")
+                    return APIResponse(
+                        ret_code=-1,
+                        ret_msg=f"摆盘数据格式异常: 未知格式{type(data)}",
+                        data=None
+                    )
             else:
                 return APIResponse(
                     ret_code=ret,
@@ -762,19 +831,28 @@ class FutuService:
             ret, data = self.quote_ctx.get_rt_ticker(code, num=num)
             
             if ret == ft.RET_OK:
-                result = self._dataframe_to_dict(data, 'ticker', DataOptimization())
-                
-                return APIResponse(
-                    ret_code=0,
-                    ret_msg=f"✅ 成功获取{code}实时逐笔（已自动订阅，条数：{num}）",
-                    data={
-                        "ticker_data": result,
-                        "code": code,
-                        "count": len(result),
-                        "subscribed": True,
-                        "timestamp": pd.Timestamp.now().isoformat()
-                    }
-                )
+                # 确保数据是DataFrame格式
+                if isinstance(data, pd.DataFrame):
+                    result = self._dataframe_to_dict(data, 'ticker', DataOptimization())
+                    
+                    return APIResponse(
+                        ret_code=0,
+                        ret_msg=f"✅ 成功获取{code}实时逐笔（已自动订阅，条数：{num}）",
+                        data={
+                            "ticker_data": result,
+                            "code": code,
+                            "count": len(result),
+                            "subscribed": True,
+                            "timestamp": pd.Timestamp.now().isoformat()
+                        }
+                    )
+                else:
+                    logger.error(f"获取逐笔数据返回非DataFrame格式: {type(data)}")
+                    return APIResponse(
+                        ret_code=-1,
+                        ret_msg=f"逐笔数据格式异常: 期望DataFrame，实际{type(data)}",
+                        data=None
+                    )
             else:
                 return APIResponse(
                     ret_code=ret,
@@ -817,19 +895,28 @@ class FutuService:
             ret, data = self.quote_ctx.get_rt_data(code)
             
             if ret == ft.RET_OK:
-                result = self._dataframe_to_dict(data, 'rt_data', DataOptimization())
-                
-                return APIResponse(
-                    ret_code=0,
-                    ret_msg=f"✅ 成功获取{code}实时分时（已自动订阅，数据点：{len(result)}）",
-                    data={
-                        "rt_data": result,
-                        "code": code,
-                        "data_points": len(result),
-                        "subscribed": True,
-                        "timestamp": pd.Timestamp.now().isoformat()
-                    }
-                )
+                # 确保数据是DataFrame格式
+                if isinstance(data, pd.DataFrame):
+                    result = self._dataframe_to_dict(data, 'rt_data', DataOptimization())
+                    
+                    return APIResponse(
+                        ret_code=0,
+                        ret_msg=f"✅ 成功获取{code}实时分时（已自动订阅，数据点：{len(result)}）",
+                        data={
+                            "rt_data": result,
+                            "code": code,
+                            "data_points": len(result),
+                            "subscribed": True,
+                            "timestamp": pd.Timestamp.now().isoformat()
+                        }
+                    )
+                else:
+                    logger.error(f"获取分时数据返回非DataFrame格式: {type(data)}")
+                    return APIResponse(
+                        ret_code=-1,
+                        ret_msg=f"分时数据格式异常: 期望DataFrame，实际{type(data)}",
+                        data=None
+                    )
             else:
                 return APIResponse(
                     ret_code=ret,
