@@ -139,9 +139,9 @@ class RTDataRequest(BaseModel):
 
 class TradingDaysRequest(BaseModel):
     """交易日请求"""
-    market: Market = Field(..., description="市场")
-    start: Optional[str] = Field(None, description="开始日期")
-    end: Optional[str] = Field(None, description="结束日期")
+    market: Market = Field(..., description="市场类型")
+    start: str = Field(..., description="开始日期，格式：'2020-01-01'")
+    end: str = Field(..., description="结束日期，格式：'2020-12-31'")
     optimization: DataOptimization = Field(default_factory=DataOptimization, description="数据优化配置")
 
 
@@ -180,4 +180,33 @@ class KLineData(BaseModel):
     volume: int = Field(..., description="成交量")
     turnover: float = Field(..., description="成交额")
     change_rate: float = Field(..., description="涨跌幅")
-    last_close: float = Field(..., description="昨收价") 
+    last_close: float = Field(..., description="昨收价")
+
+
+# === MCP专用增强请求模型 ===
+
+class RealtimeQuoteEnhancedRequest(BaseModel):
+    """MCP专用：增强实时报价请求"""
+    codes: List[str] = Field(..., description="股票代码列表，如['HK.00700', 'US.AAPL']")
+    fields: Optional[List[str]] = Field(None, description="指定返回字段，为空则返回核心字段")
+    optimization: DataOptimization = Field(default_factory=DataOptimization, description="数据优化配置")
+
+
+class RealtimeOrderBookEnhancedRequest(BaseModel):
+    """MCP专用：增强实时摆盘请求"""
+    code: str = Field(..., description="股票代码，如'HK.00700'")
+    num: int = Field(10, description="档位数量，默认10档")
+    optimization: DataOptimization = Field(default_factory=DataOptimization, description="数据优化配置")
+
+
+class RealtimeTickerEnhancedRequest(BaseModel):
+    """MCP专用：增强实时逐笔请求"""
+    code: str = Field(..., description="股票代码，如'HK.00700'")
+    num: int = Field(100, description="获取逐笔条数，默认100条")
+    optimization: DataOptimization = Field(default_factory=DataOptimization, description="数据优化配置")
+
+
+class RealtimeDataEnhancedRequest(BaseModel):
+    """MCP专用：增强实时分时请求"""
+    code: str = Field(..., description="股票代码，如'HK.00700'")
+    optimization: DataOptimization = Field(default_factory=DataOptimization, description="数据优化配置") 

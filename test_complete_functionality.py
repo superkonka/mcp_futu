@@ -94,6 +94,7 @@ class FutuServiceTester:
         print("📊 基础服务测试")
         await self.test_endpoint("健康检查", "GET", "/health")
         await self.test_endpoint("缓存状态", "GET", "/api/cache/status")
+        await self.test_endpoint("时间查询", "GET", "/api/time/current")
         print()
         
         # 2. 股票报价测试

@@ -22,9 +22,10 @@ class FutuAssistant:
             "4": {"name": "股票报价", "cmd": "self.get_stock_quote()", "desc": "获取实时股票报价"},
             "5": {"name": "技术分析", "cmd": "self.get_technical_analysis()", "desc": "计算技术指标"},
             "6": {"name": "缓存状态", "cmd": "self.check_cache()", "desc": "查看缓存系统状态"},
-            "7": {"name": "API文档", "cmd": "self.open_docs()", "desc": "打开API文档"},
-            "8": {"name": "查看日志", "cmd": "self.check_logs()", "desc": "检查服务运行日志"},
-            "9": {"name": "故障诊断", "cmd": "self.diagnose()", "desc": "智能故障诊断"},
+            "7": {"name": "时间查询", "cmd": "self.get_current_time()", "desc": "获取当前时间和时间上下文"},
+            "8": {"name": "API文档", "cmd": "self.open_docs()", "desc": "打开API文档"},
+            "9": {"name": "查看日志", "cmd": "self.check_logs()", "desc": "检查服务运行日志"},
+            "a": {"name": "故障诊断", "cmd": "self.diagnose()", "desc": "智能故障诊断"},
             "0": {"name": "退出", "cmd": "exit", "desc": "退出助手"}
         }
     
@@ -167,6 +168,64 @@ class FutuAssistant:
                 print(f"❌ 请求失败 - HTTP {response.status_code}")
         except Exception as e:
             print(f"❌ 检查缓存异常: {e}")
+    
+    def get_current_time(self):
+        """获取当前时间和时间上下文"""
+        print("🕒 获取当前时间和时间上下文...")
+        try:
+            response = requests.get(f"{self.base_url}/api/time/current", timeout=5)
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('ret_code') == 0:
+                    time_data = data.get('data', {})
+                    
+                    print("✅ 当前时间信息:")
+                    print(f"   📅 当前日期: {time_data.get('current_date')}")
+                    print(f"   🕐 当前时间: {time_data.get('current_datetime')}")
+                    
+                    # 格式化信息
+                    formatted = time_data.get('formatted', {})
+                    print(f"   🌐 中文格式: {formatted.get('chinese')}")
+                    print(f"   📆 星期: {formatted.get('weekday_chinese')}")
+                    
+                    # 市场信息
+                    market = time_data.get('market', {})
+                    print(f"\n📈 市场状态:")
+                    print(f"   🏢 交易日: {'是' if market.get('is_trading_day') else '否'}")
+                    print(f"   🔔 交易时间: {'是' if market.get('is_trading_hours') else '否'}")
+                    print(f"   🕘 开市时间: {market.get('market_open_time')}")
+                    print(f"   🕘 收市时间: {market.get('market_close_time')}")
+                    print(f"   📅 下一交易日: {market.get('next_trading_day')}")
+                    
+                    # 时间上下文映射
+                    contexts = time_data.get('time_contexts', {})
+                    print(f"\n🎯 时间上下文映射（用于模糊时间理解）:")
+                    print(f"   今天: {contexts.get('今天')}")
+                    print(f"   昨天: {contexts.get('昨天')}")
+                    print(f"   最近: {contexts.get('最近')} (最近3天)")
+                    print(f"   近期: {contexts.get('近期')} (最近7天)")
+                    print(f"   这几天: {contexts.get('这几天')} (最近5天)")
+                    print(f"   本周: {contexts.get('本周')}")
+                    print(f"   本月: {contexts.get('本月')}")
+                    
+                    # 常用时间区间
+                    periods = time_data.get('common_periods', {})
+                    print(f"\n📊 常用时间区间:")
+                    for period_name, period_data in periods.items():
+                        print(f"   {period_name}: {period_data.get('start')} 至 {period_data.get('end')}")
+                    
+                    # LLM使用建议
+                    llm_context = time_data.get('llm_context', {})
+                    print(f"\n💡 LLM使用建议:")
+                    for example in llm_context.get('usage_examples', []):
+                        print(f"   • {example}")
+                        
+                else:
+                    print(f"❌ 获取时间信息失败: {data.get('ret_msg')}")
+            else:
+                print(f"❌ 请求失败 - HTTP {response.status_code}")
+        except Exception as e:
+            print(f"❌ 获取时间信息异常: {e}")
     
     def open_docs(self):
         """打开API文档"""
@@ -331,7 +390,7 @@ class FutuAssistant:
         while True:
             self.show_menu()
             try:
-                choice = input("\n请选择功能 (0-9): ").strip()
+                choice = input("\n请选择功能 (0-9, a): ").strip()
                 if not self.run_command(choice):
                     break
                 
