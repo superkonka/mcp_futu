@@ -224,6 +224,44 @@ async def get_trading_days(request: TradingDaysRequest) -> APIResponse:
         logger.error(f"获取交易日历失败: {e}")
         return APIResponse(ret_code=-1, ret_msg=f"获取交易日历失败: {e}", data=None)
 
+# 在其他API接口后面添加
+
+@app.post("/api/trade/history_deal_list", 
+          operation_id="get_history_deal_list",
+          summary="查询历史成交",
+          description="查询交易业务账户的历史成交列表，支持代码过滤、市场过滤、时间范围过滤。注意：仅支持真实环境")
+async def get_history_deal_list(request: HistoryDealListRequest) -> APIResponse:
+    """查询历史成交 - 获取账户历史成交记录，包含买卖分析和费用统计"""
+    try:
+        return await futu_service.get_history_deal_list(request)
+    except Exception as e:
+        logger.error(f"查询历史成交失败: {e}")
+        return APIResponse(ret_code=-1, ret_msg=f"查询历史成交失败: {e}", data=None)
+
+@app.post("/api/trade/history_order_list", 
+          operation_id="get_history_order_list",
+          summary="查询历史订单",
+          description="查询指定交易业务账户的历史订单列表，支持订单状态过滤、代码过滤、市场过滤、时间范围过滤")
+async def get_history_order_list(request: HistoryOrderListRequest) -> APIResponse:
+    """查询历史订单 - 获取账户历史订单记录，包含订单状态和成交信息"""
+    try:
+        return await futu_service.get_history_order_list(request)
+    except Exception as e:
+        logger.error(f"查询历史订单失败: {e}")
+        return APIResponse(ret_code=-1, ret_msg=f"查询历史订单失败: {e}", data=None)
+
+@app.post("/api/trade/order_fee_query", 
+          operation_id="get_order_fee_query",
+          summary="查询订单费用",
+          description="查询指定订单的收费明细，包含佣金、平台使用费、监管费等各项费用")
+async def get_order_fee_query(request: OrderFeeQueryRequest) -> APIResponse:
+    """查询订单费用 - 获取订单的详细费用明细和总费用"""
+    try:
+        return await futu_service.get_order_fee_query(request)
+    except Exception as e:
+        logger.error(f"查询订单费用失败: {e}")
+        return APIResponse(ret_code=-1, ret_msg=f"查询订单费用失败: {e}", data=None)
+
 # 增强的健康检查端点
 @app.get("/health")
 async def health_check():
@@ -277,4 +315,4 @@ if __name__ == "__main__":
         port=8000,
         reload=True,
         log_level="info"
-    ) 
+    )

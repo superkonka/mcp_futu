@@ -64,9 +64,19 @@ async def lifespan(app: FastAPI):
         else:
             logger.warning("⚠️  富途OpenD连接失败，部分功能可能不可用")
         
+        # 创建并配置MCP服务 - 移到这里，确保在服务初始化后
+        mcp = FastApiMCP(
+            app,
+            name="富途证券增强版MCP服务",
+            description="增强版富途证券API服务，集成15+技术指标、智能缓存系统、专业量化分析功能。支持港股、美股、A股实时报价，K线数据，技术分析指标计算，智能缓存优化，交易历史查询等功能。注意：持仓历史需通过历史成交数据计算。"
+        )
+        
+        # 挂载MCP服务到FastAPI应用
+        mcp.mount()
+        
         # 等待 MCP 服务器完全初始化
         logger.info("🔄 等待 MCP 服务器初始化...")
-        await asyncio.sleep(3)
+        await asyncio.sleep(2)
         
         _server_ready = True
         logger.info("✅ 增强版 MCP 服务器初始化完成")
@@ -782,6 +792,42 @@ async def get_rsi_indicator(request: TechnicalAnalysisRequest) -> Dict[str, Any]
 
 
 # ==================== 缓存管理接口 ====================
+@app.post("/api/system/request_quote_rights",
+          operation_id="request_quote_rights", 
+          summary="🔧 请求最高行情权限",
+          description="手动请求最高行情权限，解决权限被抢占的问题")
+async def request_quote_rights() -> Dict[str, Any]:
+    """手动请求最高行情权限"""
+    if not _server_ready or not futu_service:
+        return {
+            "success": False,
+            "message": "服务未就绪",
+            "timestamp": datetime.now().isoformat()
+        }
+    
+    try:
+        # 强制检查并请求权限
+        logger.info("📞 接收到手动权限请求...")
+        success = await futu_service._check_and_ensure_quote_rights(force_check=True)
+        
+        return {
+            "success": success,
+            "message": "权限请求成功" if success else "权限请求失败，请检查OpenD连接和Telnet端口",
+            "rights_checked": futu_service._quote_rights_checked,
+            "last_check_time": futu_service._last_quote_rights_check,
+            "auto_request_enabled": futu_service._quote_rights_auto_request,
+            "timestamp": datetime.now().isoformat()
+        }
+        
+    except Exception as e:
+        logger.error(f"手动权限请求异常: {str(e)}")
+        return {
+            "success": False,
+            "message": f"权限请求异常: {str(e)}",
+            "timestamp": datetime.now().isoformat()
+        }
+
+
 @app.get("/api/cache/status",
          operation_id="get_cache_status",
          summary="获取缓存状态")
@@ -951,37 +997,296 @@ async def get_stock_basicinfo(request: StockBasicInfoRequest) -> APIResponse:
         return APIResponse(ret_code=-1, ret_msg=f"获取股票基本信息失败: {e}", data=None)
 
 
-@app.post("/api/quote/subscribe", 
-          operation_id="subscribe_quotes_deprecated",
-          summary="⚠️ 已弃用：订阅功能（MCP不支持）",
-          deprecated=True)
-async def subscribe_quotes_deprecated(request: SubscribeRequest) -> APIResponse:
-    """
-    ⚠️ 已弃用：订阅功能不适合MCP协议
+@app.post("/api/quote/trading_days", 
+          operation_id="get_trading_days",
+          summary="获取交易日",
+          description="获取指定市场在指定时间段内的交易日列表")
+async def get_trading_days(request: TradingDaysRequest) -> APIResponse:
+    """获取交易日 - 查询指定时间段内的交易日"""
+    if not _server_ready:
+        return APIResponse(ret_code=-1, ret_msg="服务器正在初始化中，请稍后重试", data=None)
     
-    MCP是单次同步请求-响应模式，不支持长连接和回调推送。
-    
-    建议使用以下替代接口：
-    - POST /api/quote/stock_quote - 获取实时报价
-    - POST /api/quote/order_book - 获取实时摆盘  
-    - POST /api/quote/rt_ticker - 获取实时逐笔
-    - POST /api/quote/rt_data - 获取实时分时
-    - POST /api/quote/current_kline - 获取实时K线
-    """
-    return APIResponse(
-        ret_code=-1, 
-        ret_msg="⚠️ 订阅功能已弃用。MCP协议不支持长连接推送。请使用对应的get_*接口直接拉取实时数据。", 
-        data={
-            "alternative_endpoints": [
-                "/api/quote/stock_quote - 获取实时报价",
-                "/api/quote/order_book - 获取实时摆盘",
-                "/api/quote/rt_ticker - 获取实时逐笔", 
-                "/api/quote/rt_data - 获取实时分时",
-                "/api/quote/current_kline - 获取实时K线"
-            ]
-        }
-    )
+    try:
+        return await futu_service.get_trading_days(request)
+    except Exception as e:
+        logger.error(f"获取交易日历失败: {e}")
+        return APIResponse(ret_code=-1, ret_msg=f"获取交易日历失败: {e}", data=None)
 
+
+@app.post("/api/quote/capital_flow", 
+          operation_id="get_capital_flow",
+          summary="获取资金流向",
+          description="获取个股资金流向数据，包括主力、大单、中单、小单的净流入情况")
+async def get_capital_flow(request: CapitalFlowRequest) -> APIResponse:
+    """获取资金流向 - 分析主力资金动向和散户情绪"""
+    if not _server_ready:
+        return APIResponse(ret_code=-1, ret_msg="服务器正在初始化中，请稍后重试", data=None)
+    
+    try:
+        return await futu_service.get_capital_flow(request)
+    except Exception as e:
+        logger.error(f"获取资金流向失败: {e}")
+        return APIResponse(ret_code=-1, ret_msg=f"获取资金流向失败: {e}", data=None)
+
+
+@app.post("/api/quote/capital_distribution", 
+          operation_id="get_capital_distribution",
+          summary="获取资金分布",
+          description="获取个股当前资金分布情况，分析特大单、大单、中单、小单的流入流出对比")
+async def get_capital_distribution(request: CapitalDistributionRequest) -> APIResponse:
+    """获取资金分布"""
+    if not _server_ready or not futu_service:
+        raise HTTPException(status_code=503, detail="服务未就绪")
+    
+    try:
+        return await futu_service.get_capital_distribution(request)
+    except Exception as e:
+        logger.error(f"获取资金分布异常: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"获取资金分布异常: {str(e)}")
+
+
+@app.post("/api/quote/rehab", 
+          operation_id="get_rehab",
+          summary="获取复权因子",
+          description="获取股票复权因子数据，包括拆股、合股、送股、转增股、配股、增发等公司行为的复权信息")
+async def get_rehab(request: RehabRequest) -> APIResponse:
+    """获取复权因子"""
+    if not _server_ready or not futu_service:
+        raise HTTPException(status_code=503, detail="服务未就绪")
+    
+    try:
+        return await futu_service.get_rehab(request)
+    except Exception as e:
+        logger.error(f"获取复权因子异常: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"获取复权因子异常: {str(e)}")
+
+
+@app.post("/api/market/stock_filter", 
+          operation_id="get_stock_filter",
+          summary="条件选股",
+          description="基于多种条件筛选股票，支持价格、成交量、技术指标等多维度筛选，支持板块过滤")
+async def get_stock_filter(request: StockFilterRequest) -> APIResponse:
+    """条件选股"""
+    if not _server_ready or not futu_service:
+        raise HTTPException(status_code=503, detail="服务未就绪")
+    
+    try:
+        return await futu_service.get_stock_filter(request)
+    except Exception as e:
+        logger.error(f"条件选股异常: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"条件选股异常: {str(e)}")
+
+
+@app.post("/api/market/plate_stock", 
+          operation_id="get_plate_stock",
+          summary="获取板块内股票列表",
+          description="获取指定板块内的所有股票列表，支持按字段排序")
+async def get_plate_stock(request: PlateStockRequest) -> APIResponse:
+    """获取板块内股票列表"""
+    if not _server_ready or not futu_service:
+        raise HTTPException(status_code=503, detail="服务未就绪")
+    
+    try:
+        return await futu_service.get_plate_stock(request)
+    except Exception as e:
+        logger.error(f"获取板块内股票列表异常: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"获取板块内股票列表异常: {str(e)}")
+
+
+@app.post("/api/market/plate_list", 
+          operation_id="get_plate_list",
+          summary="获取板块列表",
+          description="获取指定市场的板块列表，支持按板块类型过滤（行业、概念、地域板块）")
+async def get_plate_list(request: PlateListRequest) -> APIResponse:
+    """获取板块列表"""
+    if not _server_ready or not futu_service:
+        raise HTTPException(status_code=503, detail="服务未就绪")
+    
+    try:
+        return await futu_service.get_plate_list(request)
+    except Exception as e:
+        logger.error(f"获取板块列表异常: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"获取板块列表异常: {str(e)}")
+
+
+# ==================== 交易相关接口 ====================
+
+@app.post("/api/trade/acc_info",
+          operation_id="get_acc_info", 
+          summary="查询账户资金",
+          description="查询交易业务账户的资产净值、证券市值、现金、购买力等资金数据")
+async def get_acc_info(request: AccInfoRequest) -> APIResponse:
+    """查询账户资金 - 获取账户总资产、现金、购买力等资金信息"""
+    if not _server_ready or not futu_service:
+        raise HTTPException(status_code=503, detail="服务未就绪")
+    
+    try:
+        return await futu_service.get_acc_info(request)
+    except Exception as e:
+        logger.error(f"查询账户资金异常: {str(e)}")
+        
+        # 如果是交易连接问题，给出更具体的错误信息
+        error_msg = str(e)
+        if "交易未连接" in error_msg:
+            error_msg = "交易功能未启用，请确保富途OpenD已启动且支持交易功能"
+        elif "密码" in error_msg.lower() or "unlock" in error_msg.lower():
+            error_msg = "交易密码验证失败，请检查交易密码配置"
+        elif "账户" in error_msg:
+            error_msg = "账户信息有误，请检查账户ID或账户索引"
+        
+        raise HTTPException(status_code=500, detail=f"查询账户资金失败: {error_msg}")
+
+
+@app.post("/api/trade/position_list",
+          operation_id="get_position_list",
+          summary="查询持仓列表", 
+          description="查询交易业务账户的持仓列表，支持代码过滤、市场过滤、盈亏比例过滤等多种筛选条件")
+async def get_position_list(request: PositionListRequest) -> APIResponse:
+    """查询持仓列表 - 获取账户所有持仓信息，包含盈亏分析和市场分布"""
+    if not _server_ready or not futu_service:
+        raise HTTPException(status_code=503, detail="服务未就绪")
+    
+    try:
+        return await futu_service.get_position_list(request)
+    except Exception as e:
+        logger.error(f"查询持仓列表异常: {str(e)}")
+        
+        # 如果是交易连接问题，给出更具体的错误信息
+        error_msg = str(e)
+        if "交易未连接" in error_msg:
+            error_msg = "交易功能未启用，请确保富途OpenD已启动且支持交易功能"
+        elif "密码" in error_msg.lower() or "unlock" in error_msg.lower():
+            error_msg = "交易密码验证失败，请检查交易密码配置"
+        elif "账户" in error_msg:
+            error_msg = "账户信息有误，请检查账户ID或账户索引"
+        elif "持仓" in error_msg:
+            error_msg = "持仓数据获取失败，请检查账户是否有持仓或网络连接"
+        
+        raise HTTPException(status_code=500, detail=f"查询持仓列表失败: {error_msg}")
+
+
+@app.post("/api/trade/history_deal_list",
+          operation_id="get_history_deal_list",
+          summary="查询历史成交", 
+          description="查询交易业务账户的历史成交列表，支持代码过滤、市场过滤、时间范围过滤。注意：仅支持真实环境")
+async def get_history_deal_list(request: HistoryDealListRequest) -> APIResponse:
+    """查询历史成交 - 获取账户历史成交记录，包含买卖分析和费用统计"""
+    if not _server_ready or not futu_service:
+        raise HTTPException(status_code=503, detail="服务未就绪")
+    
+    try:
+        return await futu_service.get_history_deal_list(request)
+    except Exception as e:
+        logger.error(f"查询历史成交异常: {str(e)}")
+        
+        # 如果是交易连接问题，给出更具体的错误信息
+        error_msg = str(e)
+        if "交易未连接" in error_msg:
+            error_msg = "交易功能未启用，请确保富途OpenD已启动且支持交易功能"
+        elif "密码" in error_msg.lower() or "unlock" in error_msg.lower():
+            error_msg = "交易密码验证失败，请检查交易密码配置"
+        elif "账户" in error_msg:
+            error_msg = "账户信息有误，请检查账户ID或账户索引"
+        elif "历史成交" in error_msg or "成交" in error_msg:
+            error_msg = "历史成交数据获取失败，请检查时间范围或账户权限"
+        elif "模拟" in error_msg:
+            error_msg = "历史成交查询仅支持真实环境，不支持模拟环境"
+        
+        raise HTTPException(status_code=500, detail=f"查询历史成交失败: {error_msg}")
+
+
+@app.post("/api/trade/deal_list",
+          operation_id="get_deal_list",
+          summary="查询当日成交", 
+          description="查询交易业务账户的当日成交列表，支持代码过滤、市场过滤，包含实时成交统计")
+async def get_deal_list(request: DealListRequest) -> APIResponse:
+    """查询当日成交 - 获取账户当日成交记录，包含买卖分析和时间分布"""
+    if not _server_ready or not futu_service:
+        raise HTTPException(status_code=503, detail="服务未就绪")
+    
+    try:
+        return await futu_service.get_deal_list(request)
+    except Exception as e:
+        logger.error(f"查询当日成交异常: {str(e)}")
+        
+        # 如果是交易连接问题，给出更具体的错误信息
+        error_msg = str(e)
+        if "交易未连接" in error_msg:
+            error_msg = "交易功能未启用，请确保富途OpenD已启动且支持交易功能"
+        elif "密码" in error_msg.lower() or "unlock" in error_msg.lower():
+            error_msg = "交易密码验证失败，请检查交易密码配置"
+        elif "账户" in error_msg:
+            error_msg = "账户信息有误，请检查账户ID或账户索引"
+        elif "当日成交" in error_msg or "成交" in error_msg:
+            error_msg = "当日成交数据获取失败，请检查账户权限或网络连接"
+        
+        raise HTTPException(status_code=500, detail=f"查询当日成交失败: {error_msg}")
+
+
+@app.post("/api/trade/history_order_list",
+          operation_id="get_history_order_list",
+          summary="获取历史订单列表",
+          description="查询指定时间段内的历史订单记录，支持多种过滤条件")
+async def get_history_order_list(request: HistoryOrderListRequest) -> APIResponse:
+    """获取历史订单列表"""
+    if not _server_ready:
+        return APIResponse(ret_code=-1, ret_msg="服务器正在初始化中，请稍后重试", data=None)
+    
+    try:
+        return await futu_service.get_history_order_list(request)
+    except Exception as e:
+        logger.error(f"获取历史订单列表失败: {e}")
+        
+        # 如果是交易连接问题，给出更具体的错误信息
+        error_msg = str(e)
+        if "交易未连接" in error_msg:
+            error_msg = "交易功能未启用，请确保富途OpenD已启动且支持交易功能"
+        elif "密码" in error_msg.lower() or "unlock" in error_msg.lower():
+            error_msg = "交易密码验证失败，请检查交易密码配置"
+        elif "账户" in error_msg:
+            error_msg = "账户信息有误，请检查账户ID或账户索引"
+        
+        return APIResponse(ret_code=-1, ret_msg=f"获取历史订单列表失败: {error_msg}", data=None)
+
+
+@app.post("/api/trade/order_fee_query",
+          operation_id="get_order_fee_query",
+          summary="查询订单费用",
+          description="查询指定订单的详细费用信息，包括佣金、印花税等")
+async def get_order_fee_query(request: OrderFeeQueryRequest) -> APIResponse:
+    """查询订单费用"""
+    if not _server_ready:
+        return APIResponse(ret_code=-1, ret_msg="服务器正在初始化中，请稍后重试", data=None)
+    
+    try:
+        return await futu_service.get_order_fee_query(request)
+    except Exception as e:
+        logger.error(f"查询订单费用失败: {e}")
+        
+        # 如果是交易连接问题，给出更具体的错误信息
+        error_msg = str(e)
+        if "交易未连接" in error_msg:
+            error_msg = "交易功能未启用，请确保富途OpenD已启动且支持交易功能"
+        elif "密码" in error_msg.lower() or "unlock" in error_msg.lower():
+            error_msg = "交易密码验证失败，请检查交易密码配置"
+        elif "订单" in error_msg:
+            error_msg = "订单信息有误，请检查订单ID是否正确"
+        
+        return APIResponse(ret_code=-1, ret_msg=f"查询订单费用失败: {error_msg}", data=None)
+
+
+@app.post("/api/trade/trade_history",
+          operation_id="get_trade_history",
+          summary="获取交易历史",
+          description="获取历史成交记录（history_deal_list的别名接口）")
+async def get_trade_history(request: HistoryDealListRequest) -> APIResponse:
+    """获取交易历史（历史成交的别名）"""
+    return await get_history_deal_list(request)
+
+
+# ==================== 注意事项 ====================
+# 注意：富途API中没有"持仓历史"接口，持仓历史需要通过历史成交数据计算得出
+# 当前持仓只能通过 position_list_query 获取当前时点的持仓信息
 
 # ==================== MCP专用增强拉取接口 ====================
 
@@ -1050,16 +1355,15 @@ async def get_realtime_data_enhanced(request: RealtimeDataEnhancedRequest) -> AP
 
 
 # ==================== 启动配置 ====================
-
-# 创建并配置MCP服务
-mcp = FastApiMCP(
-    app,
-    name="富途证券增强版MCP服务",
-    description="增强版富途证券API服务，集成15+技术指标、智能缓存系统、专业量化分析功能。支持港股、美股、A股实时报价，K线数据，技术分析指标计算，智能缓存优化等功能。"
-)
-
-# 挂载MCP服务到FastAPI应用
-mcp.mount()
+# 注释掉原来的MCP创建代码，移到lifespan中
+# mcp = FastApiMCP(
+#     app,
+#     name="富途证券增强版MCP服务",
+#     description="增强版富途证券API服务，集成15+技术指标、智能缓存系统、专业量化分析功能。支持港股、美股、A股实时报价，K线数据，技术分析指标计算，智能缓存优化，交易历史查询等功能。注意：持仓历史需通过历史成交数据计算。"
+# )
+# 
+# # 挂载MCP服务到FastAPI应用
+# mcp.mount()
 
 if __name__ == "__main__":
     logger.info("🚀 启动富途MCP增强服务...")
@@ -1070,4 +1374,4 @@ if __name__ == "__main__":
         port=8001,  # 使用不同端口避免冲突
         reload=True,
         log_level="info"
-    ) 
+    )

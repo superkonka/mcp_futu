@@ -85,8 +85,8 @@ class CachePreloadRequest(BaseModel):
 
 class CacheClearRequest(BaseModel):
     """缓存清理请求"""
-    cache_type: CacheType = Field(CacheType.ALL, description="要清理的缓存类型")
-    symbols: Optional[List[str]] = Field(None, description="指定股票代码，为空则清理所有")
+    cache_type: CacheType = Field(default=CacheType.ALL, description="要清理的缓存类型")
+    symbols: Optional[List[str]] = Field(default=None, description="指定股票代码，为空则清理所有")
 
 
 # 响应模型
@@ -238,4 +238,4 @@ class TradingSignal(BaseModel):
     price: float = Field(..., description="信号价格")
     indicator_values: Dict[str, float] = Field(..., description="相关指标值")
     description: str = Field(..., description="信号描述")
-    timestamp: str = Field(..., description="信号时间") 
+    timestamp: str = Field(..., description="信号时间")
