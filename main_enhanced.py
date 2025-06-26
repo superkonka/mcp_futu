@@ -33,12 +33,13 @@ from analysis.technical_indicators import TechnicalIndicators, TechnicalData, In
 futu_service: Optional[FutuService] = None
 cache_manager: Optional[DataCacheManager] = None
 _server_ready = False
+_mcp_initialized = False  # 新增MCP初始化状态标志
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期管理"""
-    global futu_service, cache_manager, _server_ready
+    global futu_service, cache_manager, _server_ready, _mcp_initialized
     
     logger.info("🚀 启动增强版MCP Futu服务...")
     
@@ -64,6 +65,9 @@ async def lifespan(app: FastAPI):
         else:
             logger.warning("⚠️  富途OpenD连接失败，部分功能可能不可用")
         
+        # 等待服务完全初始化
+        await asyncio.sleep(3)
+        
         # 创建并配置MCP服务 - 移到这里，确保在服务初始化后
         mcp = FastApiMCP(
             app,
@@ -74,11 +78,12 @@ async def lifespan(app: FastAPI):
         # 挂载MCP服务到FastAPI应用
         mcp.mount()
         
-        # 等待 MCP 服务器完全初始化
-        logger.info("🔄 等待 MCP 服务器初始化...")
-        await asyncio.sleep(2)
+        # 增加额外的等待时间确保MCP完全初始化
+        logger.info("🔄 等待 MCP 服务器完全初始化...")
+        await asyncio.sleep(8)  # 增加等待时间到8秒
         
         _server_ready = True
+        _mcp_initialized = True
         logger.info("✅ 增强版 MCP 服务器初始化完成")
             
         yield
@@ -90,6 +95,7 @@ async def lifespan(app: FastAPI):
     finally:
         # 清理资源
         _server_ready = False
+        _mcp_initialized = False
         if futu_service:
             await futu_service.disconnect()
         logger.info("🔥 服务已停止")
@@ -113,6 +119,23 @@ app.add_middleware(
 )
 
 
+# ==================== 启动事件处理 ====================
+@app.on_event("startup")
+async def startup_event():
+    """应用启动事件 - 确保MCP完全初始化"""
+    global _server_ready, _mcp_initialized
+    
+    # 等待额外的初始化时间
+    await asyncio.sleep(2)
+    
+    if not _server_ready:
+        logger.warning("⚠️  服务器初始化延迟，请稍后重试连接")
+    elif not _mcp_initialized:
+        logger.warning("⚠️  MCP服务初始化延迟，请稍后重试连接")
+    else:
+        logger.info("✅ 服务器和MCP服务都已就绪")
+
+
 # ==================== 健康检查 ====================
 @app.get("/health")
 async def health_check():
@@ -123,6 +146,7 @@ async def health_check():
         "status": "healthy" if _server_ready else "degraded",
         "futu_connected": _server_ready,
         "cache_available": cache_manager is not None,
+        "mcp_ready": _mcp_initialized,  # 新增MCP状态
         "timestamp": datetime.now().isoformat(),
         "cache_stats": cache_stats
     }
@@ -1372,6 +1396,6 @@ if __name__ == "__main__":
         "main_enhanced:app",
         host="0.0.0.0",
         port=8001,  # 使用不同端口避免冲突
-        reload=True,
+        reload=False,  # 关闭reload避免初始化问题
         log_level="info"
     )
