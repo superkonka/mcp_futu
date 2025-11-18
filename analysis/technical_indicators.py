@@ -92,6 +92,7 @@ class TechnicalIndicators:
             }
         
         if TALIB_AVAILABLE:
+            prices = np.asarray(prices, dtype=np.float64)
             macd_line, signal_line, histogram = talib.MACD(prices, fastperiod=fast, slowperiod=slow, signalperiod=signal)
         else:
             # 纯Python实现
@@ -111,31 +112,45 @@ class TechnicalIndicators:
     def rsi(prices: np.ndarray, period: int = 14) -> np.ndarray:
         """计算RSI指标"""
         if TALIB_AVAILABLE:
-            return talib.RSI(prices, timeperiod=period)
+            prices = np.asarray(prices, dtype=np.float64)
+            rsi_vals = talib.RSI(prices, timeperiod=period)
+            # 平价场景：所有价格相同，设为中性值 50
+            if np.nanstd(prices) == 0.0:
+                fixed = np.full_like(rsi_vals, np.nan, dtype=np.float64)
+                if len(prices) >= period:
+                    fixed[period-1:] = 50.0
+                return fixed
+            return rsi_vals
         else:
             # 纯Python实现
             delta = np.diff(prices)
-            gain = np.where(delta > 0, delta, 0)
-            loss = np.where(delta < 0, -delta, 0)
+            gain = np.where(delta > 0, delta, 0.0)
+            loss = np.where(delta < 0, -delta, 0.0)
             
             avg_gain = pd.Series(gain).rolling(window=period).mean()
             avg_loss = pd.Series(loss).rolling(window=period).mean()
             
-            # 修复：处理除零情况
-            rs = np.where(avg_loss != 0, avg_gain / avg_loss, np.nan)
+            # 计算RS
+            rs = np.where(avg_loss.values != 0.0, avg_gain.values / avg_loss.values, np.nan)
             
-            # 处理特殊情况
-            rsi = np.where(avg_loss == 0, 100.0,  # 当avg_loss=0时，RSI=100
-                          np.where(avg_gain == 0, 0.0,  # 当avg_gain=0时，RSI=0
-                                  100 - (100 / (1 + rs))))  # 正常计算
+            # 平价/边界场景处理：同时为0 -> 50；仅loss为0 -> 100；仅gain为0 -> 0；正常 -> 公式
+            both_zero = (avg_gain.values == 0.0) & (avg_loss.values == 0.0)
+            only_loss_zero = (avg_loss.values == 0.0) & ~both_zero
+            only_gain_zero = (avg_gain.values == 0.0) & ~both_zero
             
-            # 在开头插入NaN以匹配原始数组长度 - 修复.values问题
-            if isinstance(rsi, pd.Series):
-                rsi_values = rsi.values
-            else:
-                rsi_values = rsi
+            rsi_calc = np.where(
+                both_zero, 50.0,
+                np.where(
+                    only_loss_zero, 100.0,
+                    np.where(
+                        only_gain_zero, 0.0,
+                        100.0 - (100.0 / (1.0 + rs))
+                    )
+                )
+            )
             
-            return np.concatenate([[np.nan], rsi_values])
+            # 对齐长度：在开头插入NaN以匹配原始价格长度
+            return np.concatenate([[np.nan], rsi_calc])
     
     @staticmethod
     def bollinger_bands(prices: np.ndarray, period: int = 20, std_dev: float = 2.0) -> Dict[str, np.ndarray]:
@@ -148,18 +163,27 @@ class TechnicalIndicators:
                 "middle": np.full(len(prices), np.nan),
                 "lower": np.full(len(prices), np.nan)
             }
-        
-        # 检查数据是否包含NaN或无效值
+    
+        prices = np.asarray(prices, dtype=np.float64)
         if np.any(np.isnan(prices)) or np.any(np.isinf(prices)):
-            logger.warning("布林带计算数据包含NaN或无穷大值，将进行清理")
-            prices = np.where(np.isnan(prices) | np.isinf(prices), np.nan, prices)
-        
+            logger.debug("布林带计算数据包含NaN或无穷大值，将进行清理")
+            prices = np.where(np.isinf(prices), np.nan, prices)
+    
         logger.debug(f"布林带计算：数据长度={len(prices)}, 周期={period}, 标准差倍数={std_dev}")
-        logger.debug(f"价格数据范围：{np.min(prices):.2f} - {np.max(prices):.2f}")
-        
+        logger.debug(f"价格数据范围：{np.nanmin(prices):.2f} - {np.nanmax(prices):.2f}")
+    
         if TALIB_AVAILABLE:
             try:
-                upper, middle, lower = talib.BBANDS(prices, timeperiod=period, nbdevup=std_dev, nbdevdn=std_dev)
+                upper, middle, lower = talib.BBANDS(
+                    prices, timeperiod=period, nbdevup=std_dev, nbdevdn=std_dev
+                )
+                upper = np.asarray(upper, dtype=np.float64)
+                middle = np.asarray(middle, dtype=np.float64)
+                lower = np.asarray(lower, dtype=np.float64)
+                # 防止 inf
+                upper = np.where(np.isinf(upper), np.nan, upper)
+                middle = np.where(np.isinf(middle), np.nan, middle)
+                lower = np.where(np.isinf(lower), np.nan, lower)
                 logger.debug("使用TA-Lib计算布林带成功")
             except Exception as e:
                 logger.error(f"TA-Lib布林带计算失败: {e}")
@@ -172,29 +196,43 @@ class TechnicalIndicators:
             # 纯Python实现 - 增强错误处理
             try:
                 df = pd.Series(prices)
-                middle = df.rolling(window=period, min_periods=1).mean()
-                std = df.rolling(window=period, min_periods=1).std()
-                
-                logger.debug(f"移动平均计算完成，最后值：{middle.iloc[-1]:.2f}")
+                # 将 min_periods 调整为 period，更贴近TA-Lib行为（可选）
+                middle_series = df.rolling(window=period, min_periods=period).mean()
+                std = df.rolling(window=period, min_periods=period).std()
+    
+                logger.debug(f"移动平均计算完成，最后值：{middle_series.iloc[-1]:.2f}")
                 logger.debug(f"标准差计算完成，最后值：{std.iloc[-1]:.2f}")
-                
-                # 处理标准差为0或NaN的情况
-                std = std.fillna(0)
-                zero_std_count = (std == 0).sum()
+    
+                # 标准差为0表示窄幅震荡：不再替换为NaN，而是记录为debug
+                zero_std_count = int((std == 0).sum())
                 if zero_std_count > 0:
-                    logger.warning(f"发现{zero_std_count}个标准差为0的点，将设为NaN")
-                    std = std.replace(0, np.nan)
-                
-                upper = middle + (std * std_dev)
-                lower = middle - (std * std_dev)
-                
+                    logger.debug(f"发现{zero_std_count}个标准差为0的点，视为窄幅震荡")
+    
+                # 填充 NaN 为 0，保证上/下轨可计算（不足窗口长度处保留NaN由 min_periods 控制）
+                std = std.fillna(0)
+    
+                upper_series = middle_series + (std * std_dev)
+                lower_series = middle_series - (std * std_dev)
+    
+                # 统一转换为 numpy 数组，避免后续索引差异
+                upper = upper_series.to_numpy()
+                middle = middle_series.to_numpy()
+                lower = lower_series.to_numpy()
+    
                 # 确保结果不包含无穷大值
                 upper = np.where(np.isinf(upper), np.nan, upper)
+                middle = np.where(np.isinf(middle), np.nan, middle)
                 lower = np.where(np.isinf(lower), np.nan, lower)
-                
+    
                 logger.debug("纯Python布林带计算成功")
-                logger.debug(f"布林带最后值 - 上轨：{upper[-1]:.2f}, 中轨：{middle.iloc[-1]:.2f}, 下轨：{lower[-1]:.2f}")
-                
+                # 安全获取最后一个有效值用于日志
+                def last_valid(v):
+                    for val in reversed(v):
+                        if not np.isnan(val):
+                            return val
+                    return np.nan
+                logger.debug(f"布林带最后值 - 上轨：{last_valid(upper):.2f}, 中轨：{last_valid(middle):.2f}, 下轨：{last_valid(lower):.2f}")
+    
             except Exception as e:
                 logger.error(f"纯Python布林带计算失败: {e}")
                 return {
@@ -202,7 +240,7 @@ class TechnicalIndicators:
                     "middle": np.full(len(prices), np.nan),
                     "lower": np.full(len(prices), np.nan)
                 }
-        
+    
         return {
             "upper": upper,
             "middle": middle,
@@ -235,7 +273,10 @@ class TechnicalIndicators:
         
         if TALIB_AVAILABLE:
             try:
-                k_percent, d_percent = talib.STOCH(high, low, close, 
+                arr_h = np.asarray(high, dtype=np.float64)
+                arr_l = np.asarray(low, dtype=np.float64)
+                arr_c = np.asarray(close, dtype=np.float64)
+                k_percent, d_percent = talib.STOCH(arr_h, arr_l, arr_c, 
                                                  fastk_period=k_period, 
                                                  slowk_period=d_period, 
                                                  slowd_period=j_period)
@@ -319,7 +360,8 @@ class TechnicalIndicators:
         mas = {}
         for period in periods:
             if TALIB_AVAILABLE:
-                mas[f"ma_{period}"] = talib.SMA(prices, timeperiod=period)
+                arr = np.asarray(prices, dtype=np.float64)
+                mas[f"ma_{period}"] = talib.SMA(arr, timeperiod=period)
             else:
                 mas[f"ma_{period}"] = pd.Series(prices).rolling(window=period).mean().values
         return mas
@@ -328,6 +370,7 @@ class TechnicalIndicators:
     def ema(prices: np.ndarray, period: int) -> np.ndarray:
         """计算指数移动平均线"""
         if TALIB_AVAILABLE:
+            prices = np.asarray(prices, dtype=np.float64)
             return talib.EMA(prices, timeperiod=period)
         else:
             return TechnicalIndicators._ema(prices, period)
@@ -353,6 +396,9 @@ class TechnicalIndicators:
     def atr(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int = 14) -> np.ndarray:
         """计算平均真实波幅"""
         if TALIB_AVAILABLE:
+            high = np.asarray(high, dtype=np.float64)
+            low = np.asarray(low, dtype=np.float64)
+            close = np.asarray(close, dtype=np.float64)
             return talib.ATR(high, low, close, timeperiod=period)
         else:
             # 计算真实波幅
@@ -370,7 +416,7 @@ class TechnicalIndicators:
     def obv(close: np.ndarray, volume: np.ndarray) -> np.ndarray:
         """计算能量潮指标"""
         if TALIB_AVAILABLE:
-            return talib.OBV(close, volume)
+            return talib.OBV(np.asarray(close, dtype=np.float64), np.asarray(volume, dtype=np.float64))
         else:
             price_change = np.diff(close)
             obv = np.zeros(len(close))
@@ -400,9 +446,12 @@ class TechnicalIndicators:
     def adx(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int = 14) -> Dict[str, np.ndarray]:
         """计算平均趋向指数"""
         if TALIB_AVAILABLE:
-            adx = talib.ADX(high, low, close, timeperiod=period)
-            plus_di = talib.PLUS_DI(high, low, close, timeperiod=period)
-            minus_di = talib.MINUS_DI(high, low, close, timeperiod=period)
+            arr_h = np.asarray(high, dtype=np.float64)
+            arr_l = np.asarray(low, dtype=np.float64)
+            arr_c = np.asarray(close, dtype=np.float64)
+            adx = talib.ADX(arr_h, arr_l, arr_c, timeperiod=period)
+            plus_di = talib.PLUS_DI(arr_h, arr_l, arr_c, timeperiod=period)
+            minus_di = talib.MINUS_DI(arr_h, arr_l, arr_c, timeperiod=period)
         else:
             # 简化的纯Python实现
             tr = TechnicalIndicators.atr(high, low, close, 1)
@@ -852,28 +901,45 @@ class TechnicalData:
     
     def _analyze_kdj_signal(self, kdj_data: Dict) -> str:
         """分析KDJ信号"""
-        k_array = kdj_data["k"]
-        d_array = kdj_data["d"]
-        
+        # 安全获取数组
+        if not kdj_data or "k" not in kdj_data or "d" not in kdj_data:
+            return "数据不足"
+        k = kdj_data["k"]
+        d = kdj_data["d"]
+
+        # 转为numpy数组，统一为float64
+        try:
+            if hasattr(k, "to_numpy"):
+                k_array = k.to_numpy(dtype=np.float64)
+            elif hasattr(k, "values"):
+                k_array = np.asarray(k.values, dtype=np.float64)
+            else:
+                k_array = np.asarray(k, dtype=np.float64)
+
+            if hasattr(d, "to_numpy"):
+                d_array = d.to_numpy(dtype=np.float64)
+            elif hasattr(d, "values"):
+                d_array = np.asarray(d.values, dtype=np.float64)
+            else:
+                d_array = np.asarray(d, dtype=np.float64)
+        except Exception:
+            return "数据无效"
+
         if len(k_array) < 1 or len(d_array) < 1:
             return "数据不足"
-        
-        try:
-            # 获取最后有效值
-            k_valid = ~np.isnan(k_array)
-            d_valid = ~np.isnan(d_array)
-            
-            if not np.any(k_valid) or not np.any(d_valid):
-                return "数据无效"
-            
-            k_current = k_array[k_valid][-1]
-            d_current = d_array[d_valid][-1]
-        except (IndexError, TypeError):
-            return "数据不足"
-        
+
+        # 获取最后一个有效值
+        k_valid = ~np.isnan(k_array)
+        d_valid = ~np.isnan(d_array)
+        if not np.any(k_valid) or not np.any(d_valid):
+            return "数据无效"
+
+        k_current = k_array[k_valid][-1]
+        d_current = d_array[d_valid][-1]
+
         if np.isnan(k_current) or np.isnan(d_current):
             return "数据无效"
-        
+
         if k_current > 80 and d_current > 80:
             return "超买区_看跌"
         elif k_current < 20 and d_current < 20:
@@ -882,35 +948,38 @@ class TechnicalData:
             return "K大于D_看涨"
         else:
             return "K小于D_看跌"
-    
+
     def _analyze_bollinger_signal(self, bb_data: Dict) -> str:
         """分析布林带信号"""
         try:
-            current_price = self.prices[-1]
+            current_price = float(self.prices[-1])
             upper_array = bb_data["upper"]
             lower_array = bb_data["lower"]
             middle_array = bb_data["middle"]
-            
+
             if len(upper_array) == 0 or len(lower_array) == 0 or len(middle_array) == 0:
                 return "数据不足"
-            
+
             # 获取最后有效值
-            upper_valid = ~np.isnan(upper_array)
-            lower_valid = ~np.isnan(lower_array)
-            middle_valid = ~np.isnan(middle_array)
-            
-            if not np.any(upper_valid) or not np.any(lower_valid) or not np.any(middle_valid):
+            def last_valid(arr):
+                vals = arr.tolist() if hasattr(arr, "tolist") else list(arr)
+                for v in reversed(vals):
+                    if v is not None and not np.isnan(v):
+                        return float(v)
+                return None
+
+            upper = last_valid(upper_array)
+            lower = last_valid(lower_array)
+            middle = last_valid(middle_array)
+
+            if upper is None or lower is None or middle is None:
                 return "数据无效"
-            
-            upper = upper_array[upper_valid][-1]
-            lower = lower_array[lower_valid][-1]
-            middle = middle_array[middle_valid][-1]
-        except (IndexError, TypeError, KeyError):
+        except (IndexError, TypeError, KeyError, ValueError):
             return "数据不足"
-        
+
         if np.isnan(upper) or np.isnan(lower) or np.isnan(middle):
             return "数据无效"
-        
+
         if current_price >= upper:
             return "触及上轨_超买"
         elif current_price <= lower:
@@ -919,34 +988,68 @@ class TechnicalData:
             return "上半区_偏强"
         else:
             return "下半区_偏弱"
-    
+
+    def _calculate_bollinger_bandwidth(self, bb_data: Dict) -> float:
+        """计算布林带宽度（健壮版）"""
+        upper_arr = bb_data.get("upper")
+        lower_arr = bb_data.get("lower")
+        middle_arr = bb_data.get("middle")
+
+        # 数组存在性与长度检查
+        for arr in (upper_arr, lower_arr, middle_arr):
+            if arr is None or len(arr) == 0:
+                return 0.0
+
+        # 提取最后一个有效值（非None、非NaN）
+        def last_valid(a):
+            values = a.tolist() if hasattr(a, "tolist") else list(a)
+            for val in reversed(values):
+                if val is not None and not np.isnan(val):
+                    return float(val)
+            return None
+
+        upper = last_valid(upper_arr)
+        lower = last_valid(lower_arr)
+        middle = last_valid(middle_arr)
+
+        # 若任何轨道无有效值或中轨为0，则返回0避免异常/除零
+        if upper is None or lower is None or middle is None:
+            return 0.0
+        if middle == 0:
+            return 0.0
+
+        return (upper - lower) / middle * 100
+
     def _analyze_adx_signal(self, adx_data: Dict) -> str:
         """分析ADX信号"""
         try:
             adx_array = adx_data["adx"]
             plus_di_array = adx_data["plus_di"]
             minus_di_array = adx_data["minus_di"]
-            
+
             if len(adx_array) == 0 or len(plus_di_array) == 0 or len(minus_di_array) == 0:
                 return "数据不足"
-            
+
             # 获取最后有效值
-            adx_valid = ~np.isnan(adx_array)
-            plus_di_valid = ~np.isnan(plus_di_array)
-            minus_di_valid = ~np.isnan(minus_di_array)
-            
-            if not np.any(adx_valid) or not np.any(plus_di_valid) or not np.any(minus_di_valid):
+            def last_valid(arr):
+                vals = arr.tolist() if hasattr(arr, "tolist") else list(arr)
+                for v in reversed(vals):
+                    if v is not None and not np.isnan(v):
+                        return float(v)
+                return None
+
+            adx = last_valid(adx_array)
+            plus_di = last_valid(plus_di_array)
+            minus_di = last_valid(minus_di_array)
+
+            if adx is None or plus_di is None or minus_di is None:
                 return "数据无效"
-            
-            adx = adx_array[adx_valid][-1]
-            plus_di = plus_di_array[plus_di_valid][-1]
-            minus_di = minus_di_array[minus_di_valid][-1]
-        except (IndexError, TypeError, KeyError):
+        except (IndexError, TypeError, KeyError, ValueError):
             return "数据不足"
-        
+
         if np.isnan(adx) or np.isnan(plus_di) or np.isnan(minus_di):
             return "数据无效"
-        
+
         if adx > 25:
             if plus_di > minus_di:
                 return "强趋势_看涨"
@@ -954,18 +1057,3 @@ class TechnicalData:
                 return "强趋势_看跌"
         else:
             return "无明显趋势_震荡"
-    
-    def _calculate_bollinger_bandwidth(self, bb_data: Dict) -> float:
-        """计算布林带宽度"""
-        upper = bb_data["upper"][-1]
-        lower = bb_data["lower"][-1]
-        middle = bb_data["middle"][-1]
-        
-        if np.isnan(upper) or np.isnan(lower) or np.isnan(middle):
-            return 0.0
-        
-        # 修复：防止除零错误
-        if middle == 0:
-            return 0.0
-        
-        return (upper - lower) / middle * 100 
