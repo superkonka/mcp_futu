@@ -118,12 +118,41 @@ class FutuService:
             
             # 交易连接
             try:
-                # 使用最新的 OpenD API 端口建立交易连接
-                self.trade_ctx = ft.OpenTradeContext(
-                    host=settings.futu_host,
-                    port=settings.futu_port
-                )
-                logger.info(f"成功连接到富途OpenD交易: {settings.futu_host}:{settings.futu_port}")
+                # 兼容不同版本的 Futu SDK：优先使用 OpenSecTradeContext
+                trade_ctx_cls = getattr(ft, "OpenSecTradeContext", None) or getattr(ft, "OpenTradeContext", None)
+                if not trade_ctx_cls:
+                    logger.error("❌ 当前 futu SDK 不包含交易上下文类（OpenSecTradeContext/OpenTradeContext）")
+                    logger.warning("⚠️ 请升级/安装正确的 futu 库，或检查环境隔离/冲突")
+                else:
+                    init_kwargs = {
+                        "host": settings.futu_host,
+                        "port": settings.futu_port,
+                    }
+                    # 如果是证券交易上下文，按官方文档增加市场过滤与券商
+                    if trade_ctx_cls.__name__ == "OpenSecTradeContext":
+                        try:
+                            init_kwargs["filter_trdmarket"] = ft.TrdMarket.HK  # 默认港股，可按需调整
+                            if hasattr(ft, "SecurityFirm"):
+                                init_kwargs["security_firm"] = ft.SecurityFirm.FUTUSECURITIES
+                        except Exception as e:
+                            logger.warning(f"初始化交易上下文参数兼容处理异常: {str(e)}")
+                    
+                    self.trade_ctx = trade_ctx_cls(**init_kwargs)
+                    logger.info(f"成功连接到富途OpenD交易: {settings.futu_host}:{settings.futu_port}")
+                    
+                    # 自动交易解锁（密码来自 .env 的 FUTU_UNLOCK_PASSWORD）
+                    unlock_pwd = getattr(settings, 'futu_unlock_password', None)
+                    if unlock_pwd:
+                        try:
+                            ret, msg = self.trade_ctx.unlock_trade(unlock_pwd)
+                            if ret == ft.RET_OK:
+                                logger.info("✅ 交易接口已解锁")
+                            else:
+                                logger.warning(f"⚠️ 交易解锁失败: {msg}")
+                        except Exception as e:
+                            logger.error(f"交易解锁异常: {str(e)}")
+                    else:
+                        logger.warning("⚠️ 未配置交易解锁密码（FUTU_UNLOCK_PASSWORD），交易接口可能不可用")
             except Exception as e:
                 logger.warning(f"连接富途OpenD交易失败，但行情功能仍可用: {str(e)}")
                 # 交易连接失败不影响行情功能
@@ -1919,7 +1948,7 @@ class FutuService:
             TrdEnv.SIMULATE: ft.TrdEnv.SIMULATE,
             TrdEnv.REAL: ft.TrdEnv.REAL
         }
-        return env_map.get(trd_env, ft.TrdEnv.SIMULATE)
+        return env_map.get(trd_env, ft.TrdEnv.REAL)
     
     def _convert_currency(self, currency: Currency) -> ft.Currency:
         """转换货币类型"""
@@ -1957,80 +1986,104 @@ class FutuService:
         }
         return currency_names.get(currency_enum, "UNKNOWN")
     
+    def _to_float_safe(self, value):
+        """将值安全转换为 float，不可转则返回 None"""
+        try:
+            if value is None:
+                return None
+            if isinstance(value, str):
+                v = value.strip()
+                if v in {"", "N/A", "NA", "--"}:
+                    return None
+                return float(v)
+            return float(value)
+        except Exception:
+            return None
+
+    def _to_int_safe(self, value):
+        """将值安全转换为 int，不可转则返回 None"""
+        try:
+            if value is None:
+                return None
+            if isinstance(value, str):
+                v = value.strip()
+                if v in {"", "N/A", "NA", "--"}:
+                    return None
+                return int(float(v))
+            return int(value)
+        except Exception:
+            return None
+
     def _parse_funds_data(self, funds_data, optimization_config) -> Dict[str, Any]:
-        """解析富途资金数据"""
+        """解析账户资金数据，容错处理 N/A/空串 等非数值"""
         if funds_data is None:
             return {}
-        
-        # 处理DataFrame格式的资金数据
-        if hasattr(funds_data, 'iloc') and len(funds_data) > 0:
-            # 取第一行数据
-            row = funds_data.iloc[0]
-            
-            parsed_data = {}
-            
-            # 基础资金信息
-            basic_fields = [
-                'power', 'max_power_short', 'net_cash_power', 'total_assets',
-                'securities_assets', 'funds_assets', 'bonds_assets', 'cash',
-                'market_val', 'frozen_cash', 'debt_cash', 'avl_withdrawal_cash'
-            ]
-            
-            for field in basic_fields:
-                if field in row:
-                    value = row[field]
-                    if pd.notna(value):
-                        parsed_data[field] = float(value)
-            
-            # 分币种现金信息
-            currency_fields = ['hkd', 'usd', 'cnh', 'jpy', 'sgd', 'aud']
-            for currency in currency_fields:
-                for suffix in ['_cash', '_avl_balance', '_net_cash_power']:
-                    field_name = f"{currency}{suffix}"
-                    if field_name in row:
-                        value = row[field_name]
-                        if pd.notna(value):
-                            parsed_data[field_name] = float(value)
-            
-            # 期货相关字段
-            futures_fields = [
-                'initial_margin', 'maintenance_margin', 'long_mv', 'short_mv',
-                'pending_asset', 'risk_status', 'margin_call_margin'
-            ]
-            
-            for field in futures_fields:
-                if field in row:
-                    value = row[field]
-                    if pd.notna(value):
+
+        # 如果是 DataFrame，先做基本清洗
+        df = funds_data
+        try:
+            if hasattr(df, "replace"):
+                df = df.replace({"": pd.NA, "N/A": pd.NA, "NA": pd.NA, "--": pd.NA})
+        except Exception:
+            pass
+
+        if hasattr(df, 'iterrows'):
+            for _, row in df.iterrows():
+                parsed_data = {}
+
+                # 基础资金信息
+                basic_fields = [
+                    'power', 'max_power_short', 'net_cash_power', 'total_assets',
+                    'securities_assets', 'funds_assets', 'bonds_assets', 'cash',
+                    'market_val', 'frozen_cash', 'debt_cash', 'avl_withdrawal_cash'
+                ]
+                for field in basic_fields:
+                    if field in row:
+                        val = self._to_float_safe(row[field])
+                        if val is not None:
+                            parsed_data[field] = val
+
+                # 分币种现金信息
+                currency_fields = ['hkd', 'usd', 'cnh', 'jpy', 'sgd', 'aud']
+                for currency in currency_fields:
+                    for suffix in ['_cash', '_avl_balance', '_net_cash_power']:
+                        field_name = f"{currency}{suffix}"
+                        if field_name in row:
+                            val = self._to_float_safe(row[field_name])
+                            if val is not None:
+                                parsed_data[field_name] = val
+
+                # 期货相关字段
+                futures_fields = [
+                    'initial_margin', 'maintenance_margin', 'long_mv', 'short_mv',
+                    'pending_asset', 'risk_status', 'margin_call_margin'
+                ]
+                for field in futures_fields:
+                    if field in row:
                         if field == 'risk_status':
-                            parsed_data[field] = int(value)
+                            val = self._to_int_safe(row[field])
                         else:
-                            parsed_data[field] = float(value)
-            
-            # 计算汇总信息
-            total_cash_value = 0
-            available_funds = 0
-            
-            # 计算各币种现金总值（简化处理，实际应考虑汇率）
-            for currency in currency_fields:
-                cash_field = f"{currency}_cash"
-                if cash_field in parsed_data:
-                    total_cash_value += parsed_data[cash_field]
-            
-            # 可用资金近似为购买力
-            if 'power' in parsed_data:
-                available_funds = parsed_data['power']
-            
-            parsed_data.update({
-                'total_cash_value': total_cash_value,
-                'available_funds': available_funds,
-                'account_type': '综合账户'  # 可以根据实际情况调整
-            })
-            
-            return parsed_data
-        
-        return {}
-    
+                            val = self._to_float_safe(row[field])
+                        if val is not None:
+                            parsed_data[field] = val
+
+                # 计算汇总信息（容错）
+                total_cash_value = 0.0
+                for currency in currency_fields:
+                    cash_field = f"{currency}_cash"
+                    if cash_field in parsed_data:
+                        total_cash_value += parsed_data[cash_field]
+
+                available_funds = parsed_data.get('power', 0.0)
+
+                parsed_data.update({
+                    'total_cash_value': total_cash_value,
+                    'available_funds': available_funds,
+                    'account_type': '综合账户'
+                })
+                return parsed_data
+
+        return {}    
     async def get_acc_info(self, request: AccInfoRequest) -> APIResponse:
         """查询账户资金"""
         self._check_trade_connection()

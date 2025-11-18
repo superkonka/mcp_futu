@@ -373,7 +373,7 @@ class DealStatus(str, Enum):
 # 交易相关请求模型
 class AccInfoRequest(BaseModel):
     """查询账户资金请求"""
-    trd_env: TrdEnv = Field(TrdEnv.SIMULATE, description="交易环境：SIMULATE(模拟), REAL(真实)")
+    trd_env: TrdEnv = Field(TrdEnv.REAL, description="交易环境：SIMULATE(模拟), REAL(真实)")
     acc_id: int = Field(0, description="交易业务账户ID，推荐使用。当传0时以acc_index为准")
     acc_index: int = Field(0, description="交易业务账户列表中的账户序号，默认0表示第1个账户")
     refresh_cache: bool = Field(False, description="是否刷新缓存，True立即请求服务器，False使用OpenD缓存")

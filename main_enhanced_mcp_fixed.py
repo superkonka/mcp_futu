@@ -267,7 +267,7 @@ MCP_TOOLS = [
             "properties": {
                 "code": {"type": "string", "description": "股票代码过滤，如 HK.00700"},
                 "deal_market": {"type": "string", "description": "市场过滤：HK/US/CN"},
-                "trd_env": {"type": "string", "default": "SIMULATE", "description": "交易环境：SIMULATE(模拟)/REAL(真实)"},
+                "trd_env": {"type": "string", "default": "REAL", "description": "交易环境：SIMULATE(模拟)/REAL(真实)"},
                 "acc_id": {"type": "integer", "default": 0, "description": "账户ID"},
                 "acc_index": {"type": "integer", "default": 0, "description": "账户序号"},
                 "refresh_cache": {"type": "boolean", "default": False, "description": "是否刷新缓存"},
@@ -310,7 +310,7 @@ MCP_TOOLS = [
             "properties": {
                 "code": {"type": "string", "description": "股票代码过滤，如 HK.00700"},
                 "position_market": {"type": "string", "description": "市场过滤：HK/US/CN"},
-                "trd_env": {"type": "string", "default": "SIMULATE", "description": "交易环境：SIMULATE(模拟)/REAL(真实)"},
+                "trd_env": {"type": "string", "default": "REAL", "description": "交易环境：SIMULATE(模拟)/REAL(真实)"},
                 "acc_id": {"type": "integer", "default": 0, "description": "账户ID"},
                 "acc_index": {"type": "integer", "default": 0, "description": "账户序号"},
                 "refresh_cache": {"type": "boolean", "default": False, "description": "是否刷新缓存"},
@@ -330,7 +330,7 @@ MCP_TOOLS = [
             "type": "object",
             "properties": {
                 "currency": {"type": "string", "description": "币种：HKD/USD/CNH/JPY"},
-                "trd_env": {"type": "string", "default": "SIMULATE", "description": "交易环境：SIMULATE(模拟)/REAL(真实)"},
+                "trd_env": {"type": "string", "default": "REAL", "description": "交易环境：SIMULATE(模拟)/REAL(真实)"},
                 "acc_id": {"type": "integer", "default": 0, "description": "账户ID"},
                 "acc_index": {"type": "integer", "default": 0, "description": "账户序号"},
                 "refresh_cache": {"type": "boolean", "default": False, "description": "是否刷新缓存"},

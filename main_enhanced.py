@@ -15,6 +15,8 @@ from loguru import logger as log  # Use alias to avoid conflicts
 from contextlib import asynccontextmanager
 from futu import *
 from fastapi_mcp import FastApiMCP
+from fastapi import Request
+from fastapi.responses import JSONResponse
 
 # Ensure we use loguru logger after futu import
 logger = log
@@ -127,6 +129,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.middleware("http")
+async def _mcp_init_guard(request: Request, call_next):
+    # MCP 就绪守卫：在 MCP 初始化完成前，拦截 /mcp 相关访问
+    global _mcp_initialized
+    path = request.url.path
+    if path.startswith("/mcp") and not _mcp_initialized:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "MCP服务正在初始化中，请稍后重试", "mcp_ready": False}
+        )
+    return await call_next(request)
+
 
 # ==================== 启动事件处理 ====================
 @app.on_event("startup")
@@ -160,6 +174,17 @@ async def health_check():
         "kimi_configured": settings.kimi_api_key is not None,
         "timestamp": datetime.now().isoformat(),
         "cache_stats": cache_stats
+    }
+
+@app.get("/mcp/status")
+async def mcp_status():
+    """MCP状态检查：让客户端在连接前确认就绪"""
+    return {
+        "mcp_ready": _mcp_initialized,
+        "server_ready": _server_ready,
+        "can_accept_connections": _mcp_initialized and _server_ready,
+        "timestamp": datetime.now().isoformat(),
+        "message": "MCP服务就绪" if _mcp_initialized else "MCP服务正在初始化中，请稍候"
     }
 
 
