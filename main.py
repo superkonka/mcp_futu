@@ -10,10 +10,10 @@ from fastapi_mcp import FastApiMCP
 from services.futu_service import FutuService
 from models.futu_models import *
 
-# 全局服务实例和状态管理
 futu_service = FutuService()
 _server_ready = False
 _initialization_start_time = None
+_mcp_initialized = False  # 新增：MCP初始化就绪标志
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -43,15 +43,26 @@ async def lifespan(app: FastAPI):
         initialization_time = time.time() - _initialization_start_time
         logger.info(f"富途MCP服务启动成功 (初始化耗时: {initialization_time:.2f}秒)")
         
+        # 延迟挂载 MCP，避免早到请求
+        # 注意：延迟足够时间以完成内部初始化，避免竞态
+        try:
+            mcp = FastApiMCP(
+                app,
+                name="富途证券行情API的MCP服务 - 提供港股、美股、A股等市场的实时行情数据",
+            )
+            mcp.mount()
+            # 额外等待，确保 SSE 路由和内部会话完全就绪
+            await asyncio.sleep(3)
+            _mcp_initialized = True
+            logger.info("✅ MCP 服务已挂载的就绪")
+        except Exception as e:
+            logger.error(f"❌ MCP 挂载失败: {e}")
+            _mcp_initialized = False
+
         yield
-        
-    except Exception as e:
-        logger.error(f"服务初始化失败: {e}")
-        _server_ready = False
-        raise
     finally:
-        # 关闭时
         _server_ready = False
+        _mcp_initialized = False
         await futu_service.disconnect()
         logger.info("富途MCP服务已停止")
 
@@ -101,6 +112,16 @@ async def check_server_ready(request, call_next):
             }
         )
     
+    # 新增：在 MCP 未初始化完成前，拦截 /mcp 请求
+    try:
+        path = request.url.path
+    except Exception:
+        path = ""
+    if path.startswith("/mcp") and not _mcp_initialized:
+        raise HTTPException(
+            status_code=503,
+            detail={"ready": False, "message": "MCP服务正在初始化中，请稍后重试", "mcp_ready": False}
+        )
     return await call_next(request)
 
 # 富途API接口 - 这些将被自动转换为MCP工具
@@ -285,7 +306,14 @@ async def health_check():
 # 添加就绪状态检查端点
 @app.get("/ready")
 async def readiness_check():
-    """就绪状态检查 - 专门用于检查服务是否准备接受请求"""
+    """MCP状态检查：让客户端在连接前确认就绪"""
+    return {
+        "mcp_ready": _mcp_initialized,
+        "server_ready": _server_ready,
+        "can_accept_connections": _mcp_initialized and _server_ready,
+        "timestamp": time.time(),
+        "message": "MCP服务就绪" if _mcp_initialized else "MCP服务正在初始化中，请稍候"
+    }
     if _server_ready and futu_service.is_connected:
         return {"ready": True, "message": "Service is ready to accept requests"}
     else:
@@ -300,19 +328,19 @@ async def readiness_check():
         )
 
 # 创建并配置MCP服务
-mcp = FastApiMCP(
-    app,
-    name="富途证券行情API的MCP服务 - 提供港股、美股、A股等市场的实时行情数据",
-)
-
-# 挂载MCP服务到FastAPI应用
-mcp.mount()
+# mcp = FastApiMCP(
+#     app,
+#     name="富途证券行情API的MCP服务 - 提供港股、美股、A股等市场的实时行情数据",
+# )
+# 
+# # 挂载MCP服务到FastAPI应用
+# mcp.mount()
 
 if __name__ == "__main__":
     uvicorn.run(
         "main:app",
         host="127.0.0.1",
         port=8000,
-        reload=True,
+        reload=False,  # 重要：避免初始化竞态
         log_level="info"
     )
