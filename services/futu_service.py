@@ -97,8 +97,9 @@ class FutuService:
         """连接到富途OpenD"""
         try:
             # 行情连接
+            # 使用最新的 OpenD API 端口建立行情连接
             self.quote_ctx = ft.OpenQuoteContext(
-                host=settings.futu_host, 
+                host=settings.futu_host,
                 port=settings.futu_port
             )
             
@@ -117,8 +118,9 @@ class FutuService:
             
             # 交易连接
             try:
+                # 使用最新的 OpenD API 端口建立交易连接
                 self.trade_ctx = ft.OpenTradeContext(
-                    host=settings.futu_host, 
+                    host=settings.futu_host,
                     port=settings.futu_port
                 )
                 logger.info(f"成功连接到富途OpenD交易: {settings.futu_host}:{settings.futu_port}")
@@ -151,14 +153,14 @@ class FutuService:
         if not self.trade_ctx:
             raise Exception("富途OpenD交易未连接")
     
-    async def _request_highest_quote_right(self, telnet_port: int = 22222) -> bool:
+    async def _request_highest_quote_right(self, telnet_port: int = None) -> bool:
         """
         🔧 智能权限管理：通过Socket请求最高行情权限
         
         当发现行情权限被抢占时，自动向OpenD发送请求最高权限命令
         
         Args:
-            telnet_port: OpenD Telnet端口，默认22222
+            telnet_port: OpenD Telnet端口，不传则读取 settings.futu_telnet_port
             
         Returns:
             bool: 是否成功请求权限
@@ -172,7 +174,8 @@ class FutuService:
             
             try:
                 # 连接到OpenD Telnet端口
-                sock.connect(('127.0.0.1', telnet_port))
+                target_port = telnet_port or getattr(settings, 'futu_telnet_port', 65234)
+                sock.connect(('127.0.0.1', target_port))
                 
                 # 发送请求最高权限命令
                 command = b'request_highest_quote_right\r\n'

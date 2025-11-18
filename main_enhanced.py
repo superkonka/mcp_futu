@@ -28,6 +28,9 @@ from config import settings
 # 导入新功能模块  
 from cache.cache_manager import DataCacheManager, CacheConfig
 from analysis.technical_indicators import TechnicalIndicators, TechnicalData, IndicatorConfig
+# 导入基本面搜索服务
+from services.fundamental_service import fundamental_service
+from models.fundamental_models import FundamentalSearchRequest, FundamentalSearchResponse
 
 # 全局变量
 futu_service: Optional[FutuService] = None
@@ -58,6 +61,12 @@ async def lifespan(app: FastAPI):
         futu_service = FutuService()
         # 设置缓存管理器
         futu_service.cache_manager = cache_manager
+
+        # 本地密钥检查（不影响服务启动，但提醒用户）
+        if not settings.metaso_api_key:
+            logger.warning("⚠️ Metaso API 密钥未配置。本地使用请在 .env 设置 METASO_API_KEY。")
+        if not settings.kimi_api_key:
+            logger.warning("⚠️ Kimi API 密钥未配置。本地使用请在 .env 设置 KIMI_API_KEY。")
         
         # 尝试连接富途OpenD
         if await futu_service.connect():
@@ -146,7 +155,9 @@ async def health_check():
         "status": "healthy" if _server_ready else "degraded",
         "futu_connected": _server_ready,
         "cache_available": cache_manager is not None,
-        "mcp_ready": _mcp_initialized,  # 新增MCP状态
+        "mcp_ready": _mcp_initialized,
+        "metaso_configured": settings.metaso_api_key is not None,
+        "kimi_configured": settings.kimi_api_key is not None,
         "timestamp": datetime.now().isoformat(),
         "cache_stats": cache_stats
     }
@@ -1306,6 +1317,162 @@ async def get_order_fee_query(request: OrderFeeQueryRequest) -> APIResponse:
 async def get_trade_history(request: HistoryDealListRequest) -> APIResponse:
     """获取交易历史（历史成交的别名）"""
     return await get_history_deal_list(request)
+
+
+# ==================== 基本面搜索接口 ====================
+
+@app.post("/api/fundamental/search",
+          operation_id="get_fundamental_search",
+          summary="🔍 基本面信息搜索",
+          description="通过metaso搜索API获取股票相关基本面信息、新闻和分析")
+async def get_fundamental_search(request: FundamentalSearchRequest) -> APIResponse:
+    """基本面信息搜索"""
+    if not _server_ready:
+        return APIResponse(ret_code=-1, ret_msg="服务器正在初始化中，请稍后重试", data=None)
+    
+    try:
+        # 调用基本面搜索服务
+        result = await fundamental_service.search_fundamental_info(request)
+        return APIResponse(
+            ret_code=0,
+            ret_msg="基本面搜索成功",
+            data=result.dict()
+        )
+    except Exception as e:
+        logger.error(f"基本面搜索失败: {e}")
+        error_msg = str(e)
+        if "网络" in error_msg or "连接" in error_msg:
+            error_msg = "搜索服务网络连接失败，请稍后重试"
+        elif "权限" in error_msg or "授权" in error_msg:
+            error_msg = "搜索服务权限验证失败"
+        elif "超时" in error_msg:
+            error_msg = "搜索请求超时，请稍后重试"
+        
+        return APIResponse(ret_code=-1, ret_msg=f"基本面搜索失败: {error_msg}", data=None)
+
+
+@app.post("/api/fundamental/stock_search",
+          operation_id="get_stock_fundamental",
+          summary="🔍 股票基本面搜索",
+          description="搜索特定股票的基本面信息，自动构建搜索关键词")
+async def get_stock_fundamental(request: dict) -> APIResponse:
+    """股票基本面搜索 - 简化接口"""
+    if not _server_ready:
+        return APIResponse(ret_code=-1, ret_msg="服务器正在初始化中，请稍后重试", data=None)
+    
+    try:
+        stock_code = request.get("stock_code", "")
+        stock_name = request.get("stock_name", "")
+        
+        if not stock_code:
+            return APIResponse(ret_code=-1, ret_msg="股票代码不能为空", data=None)
+        
+        # 调用股票基本面搜索服务
+        return await fundamental_service.search_stock_fundamental(stock_code, stock_name)
+        
+    except Exception as e:
+        logger.error(f"股票基本面搜索失败: {e}")
+        return APIResponse(ret_code=-1, ret_msg=f"股票基本面搜索失败: {str(e)}", data=None)
+
+
+@app.post("/api/fundamental/read_webpage",
+          operation_id="read_webpage",
+          summary="📄 读取网页内容",
+          description="通过metaso reader API读取任意网页的纯文本内容")
+async def read_webpage_endpoint(request: dict) -> APIResponse:
+    """读取网页内容"""
+    if not _server_ready:
+        return APIResponse(ret_code=-1, ret_msg="服务器正在初始化中，请稍后重试", data=None)
+    
+    try:
+        url = request.get("url", "")
+        if not url:
+            return APIResponse(ret_code=-1, ret_msg="网页URL不能为空", data=None)
+        
+        # 调用网页读取服务
+        content = await fundamental_service.read_webpage(url)
+        
+        return APIResponse(
+            ret_code=0,
+            ret_msg="网页读取成功",
+            data={
+                "url": url,
+                "content": content,
+                "content_length": len(content),
+                "api_source": "metaso"
+            }
+        )
+        
+    except Exception as e:
+        logger.error(f"网页读取失败: {e}")
+        error_msg = str(e)
+        if "网络" in error_msg or "连接" in error_msg:
+            error_msg = "网页读取网络连接失败，请稍后重试"
+        elif "404" in error_msg:
+            error_msg = "网页不存在或无法访问"
+        elif "超时" in error_msg:
+            error_msg = "网页读取超时，请稍后重试"
+        
+        return APIResponse(ret_code=-1, ret_msg=f"网页读取失败: {error_msg}", data=None)
+
+
+@app.post("/api/fundamental/chat",
+          operation_id="chat_completion",
+          summary="💬 智能问答",
+          description="通过metaso chat API进行智能问答对话")
+async def chat_endpoint(request: dict) -> APIResponse:
+    """智能问答"""
+    if not _server_ready:
+        return APIResponse(ret_code=-1, ret_msg="服务器正在初始化中，请稍后重试", data=None)
+    
+    try:
+        messages = request.get("messages", [])
+        model = request.get("model", "fast")
+        stream = request.get("stream", True)
+        
+        if not messages:
+            return APIResponse(ret_code=-1, ret_msg="对话消息不能为空", data=None)
+        
+        # 转换消息格式
+        formatted_messages = []
+        for msg in messages:
+            if isinstance(msg, dict) and "role" in msg and "content" in msg:
+                formatted_messages.append({
+                    "role": msg["role"],
+                    "content": msg["content"]
+                })
+            else:
+                formatted_messages.append({
+                    "role": "user",
+                    "content": str(msg)
+                })
+        
+        # 调用问答服务
+        answer = await fundamental_service.chat_completion(formatted_messages, model, stream)
+        
+        return APIResponse(
+            ret_code=0,
+            ret_msg="问答成功",
+            data={
+                "answer": answer,
+                "model": model,
+                "stream": stream,
+                "messages": formatted_messages,
+                "api_source": "metaso"
+            }
+        )
+        
+    except Exception as e:
+        logger.error(f"问答失败: {e}")
+        error_msg = str(e)
+        if "网络" in error_msg or "连接" in error_msg:
+            error_msg = "问答服务网络连接失败，请稍后重试"
+        elif "权限" in error_msg or "授权" in error_msg:
+            error_msg = "问答服务权限验证失败"
+        elif "超时" in error_msg:
+            error_msg = "问答请求超时，请稍后重试"
+        
+        return APIResponse(ret_code=-1, ret_msg=f"问答失败: {error_msg}", data=None)
 
 
 # ==================== 注意事项 ====================

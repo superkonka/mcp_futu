@@ -12,7 +12,43 @@ data/
 *.log
 logs/
 
+# 额外忽略（安全与本地环境）
+# Env 变体（仅本地，保留 env.example）
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+.env.*
+!.env.example
+
+# 密钥与证书
+*.pem
+*.key
+*.crt
+*.p12
+secrets.json
+
+# IDE/OS 文件
+.DS_Store
+.vscode/
+.idea/
+.cursor/
+
+# 缓存与运行时工件
+cache/
+.cache/
+*.sqlite
+*.sqlite3
+*.db-shm
+*.db-wal
+
+# 调试与输出
+curl_output.txt
+*.trace
+*.debug.json
+
 # 环境文件
 .env
 venv/
 .venv/
+data/futu_cache.db

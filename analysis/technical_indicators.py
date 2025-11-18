@@ -140,15 +140,68 @@ class TechnicalIndicators:
     @staticmethod
     def bollinger_bands(prices: np.ndarray, period: int = 20, std_dev: float = 2.0) -> Dict[str, np.ndarray]:
         """计算布林带"""
+        # 数据验证和预处理
+        if len(prices) < period:
+            logger.warning(f"布林带计算数据不足：需要至少{period}个数据点，实际只有{len(prices)}个")
+            return {
+                "upper": np.full(len(prices), np.nan),
+                "middle": np.full(len(prices), np.nan),
+                "lower": np.full(len(prices), np.nan)
+            }
+        
+        # 检查数据是否包含NaN或无效值
+        if np.any(np.isnan(prices)) or np.any(np.isinf(prices)):
+            logger.warning("布林带计算数据包含NaN或无穷大值，将进行清理")
+            prices = np.where(np.isnan(prices) | np.isinf(prices), np.nan, prices)
+        
+        logger.debug(f"布林带计算：数据长度={len(prices)}, 周期={period}, 标准差倍数={std_dev}")
+        logger.debug(f"价格数据范围：{np.min(prices):.2f} - {np.max(prices):.2f}")
+        
         if TALIB_AVAILABLE:
-            upper, middle, lower = talib.BBANDS(prices, timeperiod=period, nbdevup=std_dev, nbdevdn=std_dev)
+            try:
+                upper, middle, lower = talib.BBANDS(prices, timeperiod=period, nbdevup=std_dev, nbdevdn=std_dev)
+                logger.debug("使用TA-Lib计算布林带成功")
+            except Exception as e:
+                logger.error(f"TA-Lib布林带计算失败: {e}")
+                return {
+                    "upper": np.full(len(prices), np.nan),
+                    "middle": np.full(len(prices), np.nan),
+                    "lower": np.full(len(prices), np.nan)
+                }
         else:
-            # 纯Python实现
-            df = pd.Series(prices)
-            middle = df.rolling(window=period).mean()
-            std = df.rolling(window=period).std()
-            upper = middle + (std * std_dev)
-            lower = middle - (std * std_dev)
+            # 纯Python实现 - 增强错误处理
+            try:
+                df = pd.Series(prices)
+                middle = df.rolling(window=period, min_periods=1).mean()
+                std = df.rolling(window=period, min_periods=1).std()
+                
+                logger.debug(f"移动平均计算完成，最后值：{middle.iloc[-1]:.2f}")
+                logger.debug(f"标准差计算完成，最后值：{std.iloc[-1]:.2f}")
+                
+                # 处理标准差为0或NaN的情况
+                std = std.fillna(0)
+                zero_std_count = (std == 0).sum()
+                if zero_std_count > 0:
+                    logger.warning(f"发现{zero_std_count}个标准差为0的点，将设为NaN")
+                    std = std.replace(0, np.nan)
+                
+                upper = middle + (std * std_dev)
+                lower = middle - (std * std_dev)
+                
+                # 确保结果不包含无穷大值
+                upper = np.where(np.isinf(upper), np.nan, upper)
+                lower = np.where(np.isinf(lower), np.nan, lower)
+                
+                logger.debug("纯Python布林带计算成功")
+                logger.debug(f"布林带最后值 - 上轨：{upper[-1]:.2f}, 中轨：{middle.iloc[-1]:.2f}, 下轨：{lower[-1]:.2f}")
+                
+            except Exception as e:
+                logger.error(f"纯Python布林带计算失败: {e}")
+                return {
+                    "upper": np.full(len(prices), np.nan),
+                    "middle": np.full(len(prices), np.nan),
+                    "lower": np.full(len(prices), np.nan)
+                }
         
         return {
             "upper": upper,
@@ -160,25 +213,99 @@ class TechnicalIndicators:
     def kdj(high: np.ndarray, low: np.ndarray, close: np.ndarray, 
             k_period: int = 9, d_period: int = 3, j_period: int = 3) -> Dict[str, np.ndarray]:
         """计算KDJ指标"""
+        # 数据验证和预处理
+        if len(high) < k_period or len(low) < k_period or len(close) < k_period:
+            logger.warning(f"KDJ计算数据不足：需要至少{k_period}个数据点，实际只有{len(close)}个")
+            return {
+                "k": np.full(len(close), np.nan),
+                "d": np.full(len(close), np.nan),
+                "j": np.full(len(close), np.nan)
+            }
+        
+        # 检查数据是否包含NaN或无效值
+        if (np.any(np.isnan(high)) or np.any(np.isnan(low)) or np.any(np.isnan(close)) or
+            np.any(np.isinf(high)) or np.any(np.isinf(low)) or np.any(np.isinf(close))):
+            logger.warning("KDJ计算数据包含NaN或无穷大值，将进行清理")
+            high = np.where(np.isnan(high) | np.isinf(high), np.nan, high)
+            low = np.where(np.isnan(low) | np.isinf(low), np.nan, low)
+            close = np.where(np.isnan(close) | np.isinf(close), np.nan, close)
+        
+        logger.debug(f"KDJ计算：数据长度={len(close)}, K周期={k_period}, D周期={d_period}, J周期={j_period}")
+        logger.debug(f"价格范围 - 最高：{np.max(high):.2f}, 最低：{np.min(low):.2f}, 收盘：{close[-1]:.2f}")
+        
         if TALIB_AVAILABLE:
-            k_percent, d_percent = talib.STOCH(high, low, close, 
-                                             fastk_period=k_period, 
-                                             slowk_period=d_period, 
-                                             slowd_period=j_period)
-            j_percent = 3 * k_percent - 2 * d_percent
+            try:
+                k_percent, d_percent = talib.STOCH(high, low, close, 
+                                                 fastk_period=k_period, 
+                                                 slowk_period=d_period, 
+                                                 slowd_period=j_period)
+                j_percent = 3 * k_percent - 2 * d_percent
+                logger.debug("使用TA-Lib计算KDJ成功")
+            except Exception as e:
+                logger.error(f"TA-Lib KDJ计算失败: {e}")
+                return {
+                    "k": np.full(len(close), np.nan),
+                    "d": np.full(len(close), np.nan),
+                    "j": np.full(len(close), np.nan)
+                }
         else:
-            # 纯Python实现
-            lowest_low = pd.Series(low).rolling(window=k_period).min()
-            highest_high = pd.Series(high).rolling(window=k_period).max()
-            
-            # 修复：防止除零错误
-            price_range = highest_high - lowest_low
-            price_range = price_range.where(price_range != 0, np.nan)  # 当价格范围为0时设为NaN
-            
-            rsv = 100 * (close - lowest_low) / price_range
-            k_percent = rsv.ewm(alpha=1/d_period, adjust=False).mean()
-            d_percent = k_percent.ewm(alpha=1/j_period, adjust=False).mean()
-            j_percent = 3 * k_percent - 2 * d_percent
+            # 纯Python实现 - 增强错误处理
+            try:
+                # 使用pandas进行滚动计算，更稳定
+                high_series = pd.Series(high)
+                low_series = pd.Series(low)
+                close_series = pd.Series(close)
+                
+                # 计算最高价和最低价
+                lowest_low = low_series.rolling(window=k_period, min_periods=1).min()
+                highest_high = high_series.rolling(window=k_period, min_periods=1).max()
+                
+                logger.debug(f"滚动计算完成 - 最低价最后值：{lowest_low.iloc[-1]:.2f}, 最高价最后值：{highest_high.iloc[-1]:.2f}")
+                
+                # 计算价格范围，处理除零情况
+                price_range = highest_high - lowest_low
+                
+                # 处理价格范围为0的情况（所有价格相同）
+                zero_range_count = (price_range == 0).sum()
+                if zero_range_count > 0:
+                    logger.warning(f"发现{zero_range_count}个价格范围为0的点，将设为NaN")
+                    price_range = price_range.replace(0, np.nan)
+                
+                # 计算RSV（未成熟随机值）
+                rsv = 100 * (close_series - lowest_low) / price_range
+                
+                # 处理RSV中的NaN值
+                nan_rsv_count = rsv.isna().sum()
+                if nan_rsv_count > 0:
+                    logger.warning(f"发现{nan_rsv_count}个RSV为NaN的点，将设为50（中性值）")
+                    rsv = rsv.fillna(50)  # 当价格范围为0时，RSV设为50（中性值）
+                
+                logger.debug(f"RSV计算完成，最后值：{rsv.iloc[-1]:.2f}")
+                
+                # 计算K值（快速随机线）
+                k_percent = rsv.ewm(alpha=1/d_period, adjust=False).mean()
+                
+                # 计算D值（慢速随机线）
+                d_percent = k_percent.ewm(alpha=1/j_period, adjust=False).mean()
+                
+                # 计算J值
+                j_percent = 3 * k_percent - 2 * d_percent
+                
+                # 确保结果在合理范围内（0-100）
+                k_percent = np.clip(k_percent, 0, 100)
+                d_percent = np.clip(d_percent, 0, 100)
+                j_percent = np.clip(j_percent, 0, 100)
+                
+                logger.debug("纯Python KDJ计算成功")
+                logger.debug(f"KDJ最后值 - K：{k_percent.iloc[-1]:.2f}, D：{d_percent.iloc[-1]:.2f}, J：{j_percent.iloc[-1]:.2f}")
+                
+            except Exception as e:
+                logger.error(f"纯Python KDJ计算失败: {e}")
+                return {
+                    "k": np.full(len(close), np.nan),
+                    "d": np.full(len(close), np.nan),
+                    "j": np.full(len(close), np.nan)
+                }
         
         return {
             "k": k_percent,
@@ -459,31 +586,44 @@ class TechnicalData:
                 self.config.kdj_j_period
             )
             
-            # 安全地处理KDJ数据
+            # 简化KDJ数据处理逻辑
             kdj_current = {}
             kdj_values = {}
-            for k, v in kdj_data.items():
-                if hasattr(v, '__len__') and len(v) > 0:
-                    # 处理Series或array
-                    if hasattr(v, 'iloc'):
-                        # pandas Series
-                        last_val = v.iloc[-1] if len(v) > 0 else None
-                        values_list = v.tolist()
-                    else:
-                        # numpy array
-                        last_val = v[-1] if len(v) > 0 else None
-                        values_list = v.tolist() if hasattr(v, 'tolist') else list(v)
-                    
-                    kdj_current[k] = float(last_val) if last_val is not None and not np.isnan(last_val) else None
-                    kdj_values[k] = values_list
-                else:
-                    kdj_current[k] = None
-                    kdj_values[k] = []
+            
+            if kdj_data and all(k in kdj_data for k in ['k', 'd', 'j']):
+                for k, v in kdj_data.items():
+                    try:
+                        # 转换为列表
+                        if hasattr(v, 'tolist'):
+                            values_list = v.tolist()
+                        elif hasattr(v, 'iloc'):
+                            values_list = v.tolist()
+                        else:
+                            values_list = list(v)
+                        
+                        # 获取最后一个有效值
+                        last_val = None
+                        for val in reversed(values_list):
+                            if val is not None and not np.isnan(val):
+                                last_val = float(val)
+                                break
+                        
+                        kdj_current[k] = last_val
+                        kdj_values[k] = values_list
+                        
+                    except Exception as e:
+                        logger.warning(f"KDJ {k} 数据处理失败: {e}")
+                        kdj_current[k] = None
+                        kdj_values[k] = []
+            else:
+                logger.warning("KDJ数据无效")
+                kdj_current = {"k": None, "d": None, "j": None}
+                kdj_values = {"k": [], "d": [], "j": []}
             
             indicators["kdj"] = {
                 "values": kdj_values,
                 "current": kdj_current,
-                "signal": self._analyze_kdj_signal(kdj_data)
+                "signal": self._analyze_kdj_signal(kdj_data) if kdj_data else "数据无效"
             }
         except Exception as e:
             logger.warning(f"KDJ计算失败: {e}")
@@ -507,32 +647,45 @@ class TechnicalData:
                 self.config.bollinger_std
             )
             
-            # 安全地处理布林带数据
+            # 简化布林带数据处理逻辑
             bb_current = {}
             bb_values = {}
-            for k, v in bb_data.items():
-                if hasattr(v, '__len__') and len(v) > 0:
-                    # 处理Series或array
-                    if hasattr(v, 'iloc'):
-                        # pandas Series
-                        last_val = v.iloc[-1] if len(v) > 0 else None
-                        values_list = v.tolist()
-                    else:
-                        # numpy array
-                        last_val = v[-1] if len(v) > 0 else None
-                        values_list = v.tolist() if hasattr(v, 'tolist') else list(v)
-                    
-                    bb_current[k] = float(last_val) if last_val is not None and not np.isnan(last_val) else None
-                    bb_values[k] = values_list
-                else:
-                    bb_current[k] = None
-                    bb_values[k] = []
+            
+            if bb_data and all(k in bb_data for k in ['upper', 'middle', 'lower']):
+                for k, v in bb_data.items():
+                    try:
+                        # 转换为列表
+                        if hasattr(v, 'tolist'):
+                            values_list = v.tolist()
+                        elif hasattr(v, 'iloc'):
+                            values_list = v.tolist()
+                        else:
+                            values_list = list(v)
+                        
+                        # 获取最后一个有效值
+                        last_val = None
+                        for val in reversed(values_list):
+                            if val is not None and not np.isnan(val):
+                                last_val = float(val)
+                                break
+                        
+                        bb_current[k] = last_val
+                        bb_values[k] = values_list
+                        
+                    except Exception as e:
+                        logger.warning(f"布林带 {k} 数据处理失败: {e}")
+                        bb_current[k] = None
+                        bb_values[k] = []
+            else:
+                logger.warning("布林带数据无效")
+                bb_current = {"upper": None, "middle": None, "lower": None}
+                bb_values = {"upper": [], "middle": [], "lower": []}
             
             indicators["bollinger_bands"] = {
                 "values": bb_values,
                 "current": bb_current,
-                "signal": self._analyze_bollinger_signal(bb_data),
-                "bandwidth": self._calculate_bollinger_bandwidth(bb_data)
+                "signal": self._analyze_bollinger_signal(bb_data) if bb_data else "数据无效",
+                "bandwidth": self._calculate_bollinger_bandwidth(bb_data) if bb_data else 0.0
             }
         except Exception as e:
             logger.warning(f"布林带计算失败: {e}")
