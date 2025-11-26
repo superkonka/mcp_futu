@@ -28,6 +28,10 @@ class FundamentalService:
         self.api_key = settings.metaso_api_key  # 从本地环境读取
         self.timeout = 30
 
+    def is_configured(self) -> bool:
+        """是否配置了必需的API密钥"""
+        return bool(self.api_key)
+
     def _require_api_key(self):
         if not self.api_key:
             raise Exception("Metaso API 密钥未配置。请在本地 .env 设置 METASO_API_KEY。")

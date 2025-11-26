@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>实时观察室 - 面板列表</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #050814;
+      --card: rgba(15, 23, 42, 0.85);
+      --border: rgba(99, 102, 241, 0.35);
+      --muted: #94a3b8;
+      --accent: #60a5fa;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Inter","PingFang SC",system-ui;
+      background: radial-gradient(circle at top, rgba(96,165,250,0.15), var(--bg) 65%);
+      color: #e2e8f0;
+      min-height: 100vh;
+      padding-bottom: 80px;
+    }
+    header {
+      padding: 24px 32px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    header h1 {
+      margin: 0;
+      font-size: 24px;
+    }
+    header small { color: var(--muted); }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 18px;
+      padding: 0 32px;
+    }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      padding: 18px;
+      box-shadow: 0 18px 35px rgba(5,8,20,0.6);
+      transition: transform 0.2s, border-color 0.2s;
+    }
+    .card:hover {
+      transform: translateY(-4px);
+      border-color: rgba(96,165,250,0.6);
+    }
+    .card a {
+      color: inherit;
+      text-decoration: none;
+      display: block;
+    }
+    .symbol {
+      font-size: 20px;
+      font-weight: 600;
+      margin-bottom: 4px;
+    }
+    .meta {
+      display: flex;
+      justify-content: space-between;
+      font-size: 14px;
+      color: var(--muted);
+    }
+    .stats {
+      display: flex;
+      justify-content: space-between;
+      padding-top: 10px;
+      font-size: 14px;
+    }
+    .empty {
+      text-align: center;
+      color: var(--muted);
+      padding: 40px;
+    }
+    .quota-bar {
+      background: rgba(2,6,23,0.8);
+      border-radius: 999px;
+      height: 8px;
+      margin: 8px 32px 24px;
+      position: relative;
+    }
+    .quota-bar .fill {
+      height: 8px;
+      border-radius: 999px;
+      transition: width 0.3s;
+    }
+    footer {
+      text-align: center;
+      color: var(--muted);
+      margin-top: 40px;
+      font-size: 13px;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>实时观察室</h1>
+      <small>查看并管理你关注的股票面板</small>
+    </div>
+    <div id="quota-label" class="muted"></div>
+  </header>
+  <div class="quota-bar">
+    <div id="quota-fill" class="fill" style="background:#60a5fa; width:0%;"></div>
+  </div>
+  <section class="grid" id="panel-list">
+    <div class="empty">加载订阅数据...</div>
+  </section>
+  <footer id="footer-status">最后更新: --</footer>
+
+  <script>
+    async function loadPanels() {
+      try {
+        const res = await fetch('/api/dashboard/sessions');
+        if (!res.ok) throw new Error('获取失败');
+        const data = await res.json();
+        const panelList = document.getElementById('panel-list');
+        const quotaLabel = document.getElementById('quota-label');
+        const quotaFill = document.getElementById('quota-fill');
+        const footer = document.getElementById('footer-status');
+
+        footer.textContent = `最后更新: ${new Date().toLocaleString()}`;
+        const sessions = data.sessions || [];
+        const quota = data.quota || {};
+
+        const used = quota.total_used || 0;
+        const remain = quota.remain || 0;
+        const total = used + remain;
+        const percent = total ? Math.round((used / total) * 100) : 0;
+        quotaLabel.textContent = `订阅已用 ${used}/${total}，剩余 ${remain}`;
+        quotaFill.style.width = `${percent}%`;
+        quotaFill.style.background = percent > 80 ? '#f87171' : '#60a5fa';
+
+        if (!sessions.length) {
+          panelList.innerHTML = '<div class="empty">暂无订阅，可通过 MCP 调用创建看板</div>';
+          return;
+        }
+
+        panelList.innerHTML = sessions.map(item => {
+          const link = `/web/dashboard?session=${encodeURIComponent(item.session_id)}`;
+          return `
+            <div class="card">
+              <a href="${link}">
+                <div class="symbol">${item.code || '--'}</div>
+                <div class="meta">
+                  <span>Session</span>
+                  <span>${item.session_id}</span>
+                </div>
+                <div class="stats">
+                  <span>创建于</span>
+                  <span>${item.created_at ? new Date(item.created_at).toLocaleString() : '--'}</span>
+                </div>
+              </a>
+            </div>
+          `;
+        }).join('');
+      } catch (err) {
+        document.getElementById('panel-list').innerHTML = '<div class="empty">无法加载面板列表，请稍后重试</div>';
+        console.error(err);
+      }
+    }
+
+    loadPanels();
+  </script>
+</body>
+</html>

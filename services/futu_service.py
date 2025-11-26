@@ -182,6 +182,10 @@ class FutuService:
         if not self.trade_ctx:
             raise Exception("富途OpenD交易未连接")
     
+    def has_trade_connection(self) -> bool:
+        """交易连接是否可用"""
+        return self.trade_ctx is not None
+    
     async def _request_highest_quote_right(self, telnet_port: int = None) -> bool:
         """
         🔧 智能权限管理：通过Socket请求最高行情权限
@@ -781,6 +785,51 @@ class FutuService:
                 ret_msg=f"获取市场快照异常: {str(e)}",
                 data=None
             )
+
+    async def get_broker_queue(self, request: BrokerQueueRequest) -> APIResponse:
+        """获取经纪队列（买卖盘经纪）"""
+        self._check_connection()
+        try:
+            ret, data = self.quote_ctx.get_broker_queue(request.code)
+            if ret == ft.RET_OK:
+                # 兼容不同 SDK 返回结构：
+                # - 某些版本返回 (buy_df, sell_df)
+                # - 某些版本返回单个 DataFrame 或 dict
+                buy_list, sell_list = [], []
+                if isinstance(data, tuple) and len(data) == 2:
+                    buy_df, sell_df = data
+                    buy_list = self._dataframe_to_dict(buy_df, 'broker_queue_buy', request.optimization)
+                    sell_list = self._dataframe_to_dict(sell_df, 'broker_queue_sell', request.optimization)
+                    resp_data = {
+                        "broker_queue_buy": buy_list,
+                        "broker_queue_sell": sell_list,
+                        "buy_count": len(buy_list),
+                        "sell_count": len(sell_list)
+                    }
+                elif isinstance(data, pd.DataFrame):
+                    one_side = self._dataframe_to_dict(data, 'broker_queue', request.optimization)
+                    resp_data = {"broker_queue": one_side, "data_count": len(one_side)}
+                elif isinstance(data, dict):
+                    # 如果 SDK 返回 dict，尝试按 key 拆分
+                    if "buy" in data and isinstance(data["buy"], pd.DataFrame):
+                        buy_list = self._dataframe_to_dict(data["buy"], 'broker_queue_buy', request.optimization)
+                    if "sell" in data and isinstance(data["sell"], pd.DataFrame):
+                        sell_list = self._dataframe_to_dict(data["sell"], 'broker_queue_sell', request.optimization)
+                    resp_data = {
+                        "broker_queue_buy": buy_list,
+                        "broker_queue_sell": sell_list,
+                        "buy_count": len(buy_list),
+                        "sell_count": len(sell_list)
+                    }
+                else:
+                    # 最保守处理
+                    resp_data = {"raw": str(data)}
+                return APIResponse(ret_code=0, ret_msg="获取经纪队列成功", data=resp_data)
+            else:
+                return APIResponse(ret_code=ret, ret_msg=f"获取经纪队列失败: {data}", data=None)
+        except Exception as e:
+            logger.error(f"获取经纪队列异常: {str(e)}")
+            return APIResponse(ret_code=-1, ret_msg=f"获取经纪队列异常: {str(e)}", data=None)
     
     async def get_stock_basicinfo(self, request: StockBasicInfoRequest) -> APIResponse:
         """获取股票基本信息"""
@@ -861,6 +910,22 @@ class FutuService:
                 ]
             }
         )
+
+    async def get_subscription_summary(self) -> APIResponse:
+        """查询当前连接的订阅配额"""
+        self._check_connection()
+        try:
+            ret, data = await asyncio.to_thread(self.quote_ctx.query_subscription)
+            if ret == ft.RET_OK and isinstance(data, dict):
+                return APIResponse(
+                    ret_code=0,
+                    ret_msg="订阅配额查询成功",
+                    data=data
+                )
+            return APIResponse(ret_code=ret, ret_msg=f"订阅配额查询失败: {data}", data=None)
+        except Exception as e:
+            logger.error(f"订阅配额查询异常: {str(e)}")
+            return APIResponse(ret_code=-1, ret_msg=f"订阅配额查询异常: {str(e)}", data=None)
     
     async def get_order_book(self, request: OrderBookRequest) -> APIResponse:
         """获取摆盘数据"""
@@ -1374,8 +1439,8 @@ class FutuService:
                 total_records = len(result)
                 if total_records > 0:
                     latest_data = result[-1] if result else {}
-                    net_inflow = latest_data.get('in_flow', 0)
-                    main_inflow = latest_data.get('main_in_flow', 0)
+                    net_inflow = self._to_float_safe(latest_data.get('in_flow', 0)) or 0.0
+                    main_inflow = self._to_float_safe(latest_data.get('main_in_flow', 0)) or 0.0
                     
                     # 判断资金流向趋势
                     flow_trend = "中性"
@@ -1405,8 +1470,8 @@ class FutuService:
                         "summary": {
                             "overall_trend": flow_trend,
                             "main_trend": main_trend,
-                            "latest_net_inflow": latest_data.get('in_flow', 0),
-                            "latest_main_inflow": latest_data.get('main_in_flow', 0),
+                            "latest_net_inflow": net_inflow if total_records > 0 else 0,
+                            "latest_main_inflow": main_inflow if total_records > 0 else 0,
                             "latest_time": latest_data.get('capital_flow_item_time', 'N/A')
                         },
                         "timestamp": pd.Timestamp.now().isoformat()
@@ -1444,10 +1509,10 @@ class FutuService:
                     latest_data = result[0]  # 资金分布通常只有一条当前数据
                     
                     # 计算各级别净流入（流入-流出）
-                    super_net = latest_data.get('capital_in_super', 0) - latest_data.get('capital_out_super', 0)
-                    big_net = latest_data.get('capital_in_big', 0) - latest_data.get('capital_out_big', 0)
-                    mid_net = latest_data.get('capital_in_mid', 0) - latest_data.get('capital_out_mid', 0)
-                    small_net = latest_data.get('capital_in_small', 0) - latest_data.get('capital_out_small', 0)
+                    super_net = (self._to_float_safe(latest_data.get('capital_in_super', 0)) or 0) - (self._to_float_safe(latest_data.get('capital_out_super', 0)) or 0)
+                    big_net = (self._to_float_safe(latest_data.get('capital_in_big', 0)) or 0) - (self._to_float_safe(latest_data.get('capital_out_big', 0)) or 0)
+                    mid_net = (self._to_float_safe(latest_data.get('capital_in_mid', 0)) or 0) - (self._to_float_safe(latest_data.get('capital_out_mid', 0)) or 0)
+                    small_net = (self._to_float_safe(latest_data.get('capital_in_small', 0)) or 0) - (self._to_float_safe(latest_data.get('capital_out_small', 0)) or 0)
                     
                     # 计算总净流入
                     total_net = super_net + big_net + mid_net + small_net

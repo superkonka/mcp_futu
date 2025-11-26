@@ -16,7 +16,7 @@ class KimiChatMessage(BaseModel):
 class KimiChatRequest(BaseModel):
     """Kimi聊天请求模型"""
     messages: List[KimiChatMessage] = Field(description="对话消息列表")
-    model: str = Field(default="kimi-k2-250905", description="模型类型")
+    model: str = Field(default="kimi-k2-thinking-turbo", description="模型类型")
     stream: bool = Field(default=False, description="是否流式响应")
     temperature: Optional[float] = Field(default=0.7, description="温度参数，控制随机性")
     max_tokens: Optional[int] = Field(default=2048, description="最大生成token数")

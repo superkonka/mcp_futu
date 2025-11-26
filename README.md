@@ -55,6 +55,10 @@ python main_enhanced.py
 
 # 🎯 简化版HTTP服务（稳定）- 端口8002  
 python main_enhanced_simple_alternative.py
+
+# 5. (可选) 启动独立 MCP 包装服务 - 端口9001
+#  Web 服务和 MCP 工具彻底解耦，MCP 只负责转发到 Web API
+WEB_API_BASE_URL=http://localhost:8001 MCP_PORT=9001 python mcp_service/main.py
 ```
 
 ### 🌟 **智能统一入口（强烈推荐）**
@@ -111,6 +115,18 @@ curl http://localhost:8001/health
 ```
 
 **如果看到上述输出，恭喜您已成功启动！🎉**
+
+### 🔗 MCP 服务独立部署说明
+
+- Web API（行情、Dashboard、/api/**）仍然由 `main_enhanced.py` 提供，端口保持 8001。
+- MCP 工具改由 `mcp_service/main.py` 独立运行：
+
+```bash
+WEB_API_BASE_URL=http://localhost:8001 MCP_PORT=9001 python mcp_service/main.py
+```
+
+- `.env` 会读取 `EXTERNAL_MCP_ENDPOINT`（默认 `http://localhost:9001/mcp`）。若你修改 MCP 端口或部署方式，请同步更新该变量，以便 Web 服务在 `/mcp/status` 或重定向时提供正确地址。
+- 访问 `http://localhost:8001/mcp` 时会收到 307 重定向到外部 MCP，方便老配置顺滑迁移；建议尽快在 MCP 客户端里把地址改成新的端口。
 
 ---
 
@@ -258,7 +274,27 @@ curl -X POST http://localhost:8001/api/analysis/technical_indicators \
 - **成交量指标**: `obv`, `vwap`
 - **强度指标**: `adx`
 
-### 🗄️ **4. 缓存管理**
+### 🧠 **4. 综合分析快照（推荐用于 MCP/Agent）**
+
+```bash
+curl -X POST http://localhost:8001/api/analysis/snapshot \
+  -H "Content-Type: application/json" \
+  -d '{
+    "code": "HK.00700",
+    "include_history": true,
+    "include_technicals": true,
+    "technical_period": 120
+  }' | jq '.'
+```
+
+**接口亮点**
+
+- 一次请求即可拿到行情、技术面、资金面、最新策略、基本面信号、持仓概览
+- `insights` 字段自动给出多维统计（如利好/利空数量、策略条数、最新价格）
+- 可通过参数裁剪历史K线、资金流、技术指标等模块
+- MCP 工具 `get_analysis_snapshot` 直接复用该接口，免去多接口串联
+
+### 🗄️ **5. 缓存管理**
 
 ```bash
 # 查看缓存状态
@@ -278,6 +314,72 @@ curl -X DELETE http://localhost:8001/api/cache/clear \
   -H "Content-Type: application/json" \
   -d '{"cache_type": "memory"}'
 ```
+
+# 📝 **6. 策略建议记录与复盘**
+
+```bash
+# 保存一条策略建议
+curl -X POST http://localhost:8001/api/recommendations \
+  -H "Content-Type: application/json" \
+  -d '{
+    "code": "HK.00700",
+    "action": "BUY",
+    "rationale": "突破年线并放量，RSI回升至50上方",
+    "confidence": 0.72,
+    "timeframe": "swing",
+    "tags": ["技术面", "突破"],
+    "source": "kimi-k2-thinking-turbo",
+    "evidence": [
+      {"type": "indicator", "name": "MACD", "value": "金叉"},
+      {"type": "news", "title": "Q3 财报高于预期"}
+    ]
+  }'
+
+# 查询策略建议（可按代码、标签、采纳状态等过滤）
+curl -X POST http://localhost:8001/api/recommendations/query \
+  -H "Content-Type: application/json" \
+  -d '{
+    "code": "HK.00700",
+    "tag": "技术面",
+    "limit": 20
+  }'
+```
+
+接口会自动在 `data/recommendations.db` 中持久化记录，既能通过 HTTP 使用，也会在 MCP 客户端中以 `save_recommendation` / `get_recommendations` 工具呈现，方便大模型写入与查询策略建议。
+
+## 📺 **6. 实时可视化看板（Web）**
+
+当你希望把某只股票的行情、资讯、策略和个人持仓集中展示给同事或终端用户，可以通过新的 `create_dashboard_session` 接口为任意标的生成一个可共享的 Web 看板：
+
+```bash
+# 1) 生成会话，得到 Web URL
+curl -X POST http://localhost:8001/api/dashboard/session \
+  -H "Content-Type: application/json" \
+  -d '{"code": "HK.00700"}'
+
+# 响应示例：
+# {
+#   "session_id": "1Np4dJ6xG6M",
+#   "url": "http://localhost:8001/web/dashboard?session=1Np4dJ6xG6M"
+# }
+
+# 2) 把 url 发给浏览器或 MCP 客户端，页面会自动：
+#    • 订阅 Futu 报价/盘口/逐笔/分时等推送，并实时刷新图表
+#    • 拉取 Metaso 搜索结果，按“利好/利空”分区展示
+#    • 展示资金流向 / 资金分布 / 历史K线等关键指标
+#    • 读取最近的策略建议和（若可用）个人持仓摘要
+#    • 会话 ID 会落盘到 `data/dashboard_sessions.json`，重启服务后仍可复用链接
+
+# ⚙️ 如需让 MCP 返回公网地址，可设置 `DASHBOARD_BASE_URL` 环境变量：
+# export DASHBOARD_BASE_URL="https://your-domain.com"
+# 这样 `create_dashboard_session` 工具会直接返回公网可访问的 URL。
+
+看板页面顶部会展示所有已订阅的股票，并实时显示 Futu 订阅额度使用情况，可一键取消订阅，便于控制配额。
+
+> 另外，服务启动后控制台会输出 `http://localhost:8001/web`，打开即可查看所有看板的列表总览，并快速进入详情页。
+```
+
+MCP 侧同样会暴露 `create_dashboard_session` 工具，LLM 只需给出股票代码即可获得实时大屏的链接，实现“问即得 URL”的工作流。
 
 ---
 

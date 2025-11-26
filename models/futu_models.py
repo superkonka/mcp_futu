@@ -226,8 +226,9 @@ class SubscribeRequest(BaseModel):
     subtype_list: List[SubType] = Field(..., description="订阅类型列表")
 
 
+# 在请求模型区域，紧接着 OrderBookRequest/TickerRequest/RTDataRequest 等相邻处新增 BrokerQueueRequest
+
 class OrderBookRequest(BaseModel):
-    """摆盘请求"""
     code: str = Field(..., description="股票代码")
     num: int = Field(10, description="档位数量")
     optimization: DataOptimization = Field(default_factory=DataOptimization, description="数据优化配置")
@@ -241,8 +242,13 @@ class TickerRequest(BaseModel):
 
 
 class RTDataRequest(BaseModel):
-    """分时数据请求"""
     code: str = Field(..., description="股票代码")
+    optimization: DataOptimization = Field(default_factory=DataOptimization, description="数据优化配置")
+
+
+class BrokerQueueRequest(BaseModel):
+    """经纪队列请求"""
+    code: str = Field(..., description="股票代码，如'HK.00700'")
     optimization: DataOptimization = Field(default_factory=DataOptimization, description="数据优化配置")
 
 

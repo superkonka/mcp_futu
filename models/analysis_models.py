@@ -5,7 +5,7 @@
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any, Union
 from enum import Enum
-from models.futu_models import DataOptimization
+from models.futu_models import DataOptimization, KLType
 
 
 class IndicatorType(str, Enum):
@@ -87,6 +87,23 @@ class CacheClearRequest(BaseModel):
     """缓存清理请求"""
     cache_type: CacheType = Field(default=CacheType.ALL, description="要清理的缓存类型")
     symbols: Optional[List[str]] = Field(default=None, description="指定股票代码，为空则清理所有")
+
+
+# 综合分析请求
+class AnalysisSnapshotRequest(BaseModel):
+    """股票综合分析快照请求"""
+    code: str = Field(..., description="股票代码")
+    include_history: bool = Field(True, description="是否返回历史K线数据")
+    history_points: int = Field(240, ge=60, le=500, description="历史K线条数")
+    history_ktype: KLType = Field(KLType.K_1M, description="历史K线类型")
+    include_signals: bool = Field(True, description="是否包含基本面信号分析")
+    include_recommendations: bool = Field(True, description="是否包含策略建议快照")
+    include_holding: bool = Field(True, description="是否包含持仓概览")
+    include_capital_flow: bool = Field(True, description="是否包含资金流向")
+    include_capital_distribution: bool = Field(True, description="是否包含资金分布")
+    include_technicals: bool = Field(True, description="是否包含技术指标")
+    technical_period: int = Field(120, ge=30, le=500, description="技术指标分析周期")
+    technical_indicators: List[IndicatorType] = Field(default=[IndicatorType.ALL], description="技术指标列表")
 
 
 # 响应模型

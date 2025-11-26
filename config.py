@@ -22,11 +22,14 @@ class Settings(BaseSettings):
     # MCP 服务配置
     mcp_name: str = "futu-mcp-server"
     mcp_version: str = "1.0.0"
+    external_mcp_endpoint: Optional[str] = "http://localhost:9001/mcp"
     
     # 服务配置
     host: str = "127.0.0.1"
     port: int = 8000
     log_level: str = "INFO"
+    dashboard_base_url: str = "http://localhost:8001"
+    dashboard_session_timeout_minutes: int = 120
     
     # 行情数据缓存配置
     cache_enabled: bool = True
@@ -35,6 +38,10 @@ class Settings(BaseSettings):
     # 第三方API密钥（仅本地环境变量）
     metaso_api_key: Optional[str] = None
     kimi_api_key: Optional[str] = None
+    kimi_moonshot_key: Optional[str] = None
+    deepseek_api_key: Optional[str] = None
+    gemini_api_key: Optional[str] = None
+    gemini_model: Optional[str] = None
 
     class Config:
         env_file = ".env"

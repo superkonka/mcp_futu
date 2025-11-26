@@ -8,9 +8,9 @@
 
 ## ✅ 解决方案
 
-### 彻底修复版本：`main_enhanced_fixed_v2.py`
+### 彻底修复版本：`main_enhanced.py`
 
-采用**延迟MCP挂载策略**，完全解决时序问题：
+增强版主入口已经内置**延迟初始化 + 状态守卫**，可直接解决时序问题：
 
 1. **分离初始化**：基础服务和MCP服务分开初始化
 2. **延迟挂载**：基础服务启动后，后台任务延迟挂载MCP
@@ -32,7 +32,7 @@
 ### 1. 启动服务
 
 ```bash
-python main_enhanced_fixed_v2.py
+python main_enhanced.py
 ```
 
 ### 2. 检查服务状态
@@ -166,7 +166,7 @@ else:
 
 ```bash
 # 检查进程
-ps aux | grep main_enhanced_fixed_v2
+ps aux | grep main_enhanced.py
 
 # 检查端口
 lsof -i :8001
@@ -194,4 +194,4 @@ tail -f service.log
 - **✅ 自动恢复**：支持手动重新挂载
 - **✅ 向后兼容**：保持所有原有功能
 
-**推荐使用`main_enhanced_fixed_v2.py`作为生产版本！** 
+**推荐直接使用 `main_enhanced.py`（>=2.0）作为生产版本！** 

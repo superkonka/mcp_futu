@@ -30,6 +30,8 @@ from config import settings
 # 导入AI服务模块
 from services.fundamental_service import fundamental_service
 from services.kimi_service import kimi_service
+from services.recommendation_storage import RecommendationStorageService
+from models.recommendation_models import RecommendationWriteRequest, RecommendationQueryRequest
 
 # 自定义JSON编码器
 def json_serial(obj):
@@ -51,6 +53,7 @@ futu_service: Optional[FutuService] = None
 cache_manager: Optional[DataCacheManager] = None
 _server_ready = False
 _mcp_ready = False
+recommendation_storage: RecommendationStorageService = None
 
 # MCP工具定义
 MCP_TOOLS = [
@@ -112,7 +115,7 @@ MCP_TOOLS = [
     },
     {
         "name": "get_kimi_chat",
-        "description": "🔥 火山引擎Kimi对话 - 通过火山引擎ark API调用kimi-k2-250905模型进行智能对话",
+        "description": "🔥 火山引擎Kimi对话 - 通过火山引擎ark API调用kimi-k2-thinking-turbo模型进行智能对话",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -128,7 +131,7 @@ MCP_TOOLS = [
                     },
                     "description": "对话消息列表，格式：[{'role': 'user', 'content': '问题内容'}]"
                 },
-                "model": {"type": "string", "default": "kimi-k2-250905", "description": "模型类型，默认kimi-k2-250905"},
+                "model": {"type": "string", "default": "kimi-k2-thinking-turbo", "description": "模型类型，默认kimi-k2-thinking-turbo"},
                 "temperature": {"type": "number", "default": 0.7, "description": "温度参数，控制随机性(0-1)"},
                 "max_tokens": {"type": "integer", "default": 2048, "description": "最大生成token数"}
             },
@@ -212,6 +215,64 @@ MCP_TOOLS = [
             "type": "object",
             "properties": {
                 "code": {"type": "string", "description": "股票代码，如 HK.00700"},
+                "optimization": {
+                    "type": "object",
+                    "properties": {
+                        "only_essential_fields": {"type": "boolean", "default": True}
+                    }
+                }
+            },
+            "required": ["code"]
+        }
+    },
+    {
+        "name": "get_market_snapshot",
+        "description": "获取市场快照（多标的）",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "code_list": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "股票代码列表，如 ['HK.00700','US.AAPL']"
+                },
+                "optimization": {
+                    "type": "object",
+                    "properties": {
+                        "only_essential_fields": {"type": "boolean", "default": True}
+                    }
+                }
+            },
+            "required": ["code_list"]
+        }
+    },
+    {
+        "name": "get_current_kline",
+        "description": "获取当前K线数据（最近N根）",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "code": {"type": "string", "description": "股票代码，如 'HK.00700'"},
+                "num": {"type": "integer", "default": 100, "description": "返回数据点数量"},
+                "ktype": {"type": "string", "default": "K_DAY", "description": "K线类型：K_1M/K_5M/K_DAY/K_WEEK/K_MON 等"},
+                "autype": {"type": "string", "default": "qfq", "description": "复权类型：qfq/hfq/None"},
+                "optimization": {
+                    "type": "object",
+                    "properties": {
+                        "only_essential_fields": {"type": "boolean", "default": True}
+                    }
+                }
+            },
+            "required": ["code"]
+        }
+    },
+    {
+        "name": "get_broker_queue",
+        "description": "获取经纪队列（买卖盘经纪）",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "code": {"type": "string", "description": "股票代码，如 'HK.00700'"},
                 "optimization": {
                     "type": "object",
                     "properties": {
@@ -415,6 +476,45 @@ MCP_TOOLS = [
             },
             "required": ["messages"]
         }
+    },
+    {
+        "name": "save_recommendation",
+        "description": "保存股票操作建议与依据，便于后续验证与复盘",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "code": {"type": "string", "description": "股票代码，如 HK.00700"},
+                "action": {"type": "string", "enum": ["BUY","SELL","HOLD","EXIT","ADD","REDUCE","WATCH"], "description": "操作类型"},
+                "rationale": {"type": "string", "description": "建议依据/理由"},
+                "confidence": {"type": "number", "minimum": 0, "maximum": 1, "description": "信心度(0-1)"},
+                "timeframe": {"type": "string", "description": "适用时间框架"},
+                "adopted": {"type": "boolean", "description": "是否已采纳"},
+                "tags": {"type": "array", "items": {"type": "string"}, "description": "标签数组"},
+                "source": {"type": "string", "description": "来源，模型或分析师"},
+                "evidence": {"type": "array", "items": {}, "description": "证据列表（文本/对象）"},
+                "adopted_at": {"type": "string", "description": "采纳时间(ISO8601)"},
+                "outcome": {"type": "object", "description": "结果复盘对象"}
+            },
+            "required": ["code", "action", "rationale"]
+        }
+    },
+    {
+        "name": "get_recommendations",
+        "description": "按条件查询股票操作建议记录（支持代码/操作/采纳/时间等过滤）",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "code": {"type": "string"},
+                "action": {"type": "string"},
+                "adopted": {"type": "boolean"},
+                "start": {"type": "string"},
+                "end": {"type": "string"},
+                "tag": {"type": "string"},
+                "source": {"type": "string"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 200},
+                "offset": {"type": "integer", "minimum": 0}
+            }
+        }
     }
 ]
 
@@ -441,6 +541,10 @@ async def lifespan(app: FastAPI):
         futu_service = FutuService()
         # 设置缓存管理器
         futu_service.cache_manager = cache_manager
+        # 初始化推荐存储服务
+        global recommendation_storage
+        recommendation_storage = RecommendationStorageService(db_path="data/recommendations.db")
+        logger.info("✅ 推荐存储服务初始化成功")
         
         # 尝试连接富途OpenD
         if await futu_service.connect():
@@ -508,7 +612,7 @@ async def health_check():
 @app.get("/mcp")
 async def mcp_get():
     """MCP GET方法 - 返回服务器信息"""
-    return {
+    payload = {
         "jsonrpc": "2.0",
         "id": None,
         "result": {
@@ -522,6 +626,7 @@ async def mcp_get():
             }
         }
     }
+    return Response(content=json.dumps(payload, ensure_ascii=False), media_type="application/json")
 
 
 @app.post("/mcp")
@@ -529,12 +634,17 @@ async def mcp_post(request: Request):
     """MCP POST方法 - 处理JSON-RPC请求"""
     return await handle_mcp_request(request)
 
+@app.options("/mcp")
+async def mcp_options():
+    # CORS预检请求直接返回
+    return Response(status_code=204)
+
 
 # ==================== 根路径MCP支持（兼容性） ====================
 @app.get("/")
 async def root_get():
     """根路径GET方法 - 返回服务器信息"""
-    return {
+    payload = {
         "jsonrpc": "2.0",
         "id": None,
         "result": {
@@ -548,12 +658,18 @@ async def root_get():
             }
         }
     }
+    return Response(content=json.dumps(payload, ensure_ascii=False), media_type="application/json")
 
 
 @app.post("/")
 async def root_post(request: Request):
     """根路径POST方法 - 处理JSON-RPC请求"""
     return await handle_mcp_request(request)
+
+@app.options("/")
+async def root_options():
+    # CORS预检请求直接返回
+    return Response(status_code=204)
 
 
 async def handle_mcp_request(request: Request):
@@ -648,6 +764,12 @@ async def handle_tools_call(params: Dict, request_id: str):
             result = await call_get_rt_ticker(arguments)
         elif tool_name == "get_rt_data":
             result = await call_get_rt_data(arguments)
+        elif tool_name == "get_market_snapshot":
+            result = await call_get_market_snapshot(arguments)
+        elif tool_name == "get_current_kline":
+            result = await call_get_current_kline(arguments)
+        elif tool_name == "get_broker_queue":
+            result = await call_get_broker_queue(arguments)
         elif tool_name == "get_capital_flow":
             result = await call_get_capital_flow(arguments)
         elif tool_name == "get_capital_distribution":
@@ -680,8 +802,12 @@ async def handle_tools_call(params: Dict, request_id: str):
             result = await call_chat_completion(arguments)
         elif tool_name == "get_kimi_chat":
             result = await call_get_kimi_chat(arguments)
+        elif tool_name == "save_recommendation":
+            result = await call_save_recommendation(arguments)
+        elif tool_name == "get_recommendations":
+            result = await call_get_recommendations(arguments)
         else:
-            return create_error_response(request_id, -32601, f"Tool not found: {tool_name}")
+            raise ValueError(f"未知工具: {tool_name}")
         
         return {
             "jsonrpc": "2.0",
@@ -897,6 +1023,42 @@ async def call_get_rt_data(arguments: Dict) -> Dict:
     return result.dict()
 
 
+async def call_get_market_snapshot(arguments: Dict) -> Dict:
+    """调用市场快照功能"""
+    code_list = arguments.get("code_list", [])
+    optimization = arguments.get("optimization", {})
+    if not code_list or not isinstance(code_list, list):
+        raise ValueError("股票代码列表不能为空")
+    request = MarketSnapshotRequest(code_list=code_list, optimization=optimization)
+    result = await futu_service.get_market_snapshot(request)
+    return result.dict()
+
+
+async def call_get_current_kline(arguments: Dict) -> Dict:
+    """调用当前K线功能"""
+    code = arguments.get("code")
+    num = int(arguments.get("num", 100))
+    ktype = arguments.get("ktype", "K_DAY")
+    autype = arguments.get("autype", "qfq")
+    optimization = arguments.get("optimization", {})
+    if not code:
+        raise ValueError("股票代码不能为空")
+    request = CurrentKLineRequest(code=code, num=num, ktype=ktype, autype=autype, optimization=optimization)
+    result = await futu_service.get_current_kline(request)
+    return result.dict()
+
+
+async def call_get_broker_queue(arguments: Dict) -> Dict:
+    """调用经纪队列功能"""
+    code = arguments.get("code")
+    optimization = arguments.get("optimization", {})
+    if not code:
+        raise ValueError("股票代码不能为空")
+    request = BrokerQueueRequest(code=code, optimization=optimization)
+    result = await futu_service.get_broker_queue(request)
+    return result.dict()
+
+
 async def call_get_capital_flow(arguments: Dict) -> Dict:
     """调用资金流向功能"""
     code = arguments.get("code")
@@ -1046,440 +1208,40 @@ async def call_get_acc_info(arguments: Dict) -> Dict:
 
 
 async def call_get_cache_status(arguments: Dict) -> Dict:
-    """调用缓存状态功能"""
+    """调用缓存系统状态功能"""
     detailed = arguments.get("detailed", False)
-    
-    if cache_manager:
-        result = await cache_manager.get_cache_stats()
+    if cache_manager is None:
+        return {"ret_code": -1, "ret_msg": "缓存管理器未初始化", "data": {}}
+    try:
         if detailed:
-            # 如果需要详细信息，可以添加更多字段
-            result["detailed"] = True
-    else:
-        result = {"error": "缓存管理器未初始化"}
-    
-    return result
-
-
-# ==================== 原有API接口（保持兼容性） ====================
-@app.get("/api/time/current")
-async def get_current_time() -> Dict[str, Any]:
-    """获取当前时间信息"""
-    now = datetime.now()
-    
-    # 计算一些常用的时间点
-    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    yesterday_start = today_start - timedelta(days=1)
-    week_start = today_start - timedelta(days=now.weekday())  # 本周一
-    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    
-    return {
-        "current_time": now.isoformat(),
-        "timezone": "Asia/Shanghai",
-        "today_start": today_start.isoformat(),
-        "yesterday_start": yesterday_start.isoformat(),
-        "week_start": week_start.isoformat(),
-        "month_start": month_start.isoformat(),
-        "timestamp": int(now.timestamp())
-    }
-
-
-@app.post("/api/quote/stock_quote")
-async def get_stock_quote_enhanced(request: StockQuoteRequest) -> APIResponse:
-    """获取股票报价（缓存增强）"""
-    try:
-        start_time = time.time()
-        
-        # 调用富途服务获取报价
-        result = await futu_service.get_stock_quote(
-            request.code_list, 
-            request.optimization
-        )
-        
-        execution_time = time.time() - start_time
-        
-        return APIResponse(
-            ret_code=0,
-            ret_msg="获取股票报价成功",
-            data=result,
-            execution_time=execution_time
-        )
-        
-    except Exception as e:
-        logger.error(f"获取股票报价失败: {e}")
-        return APIResponse(
-            ret_code=-1,
-            ret_msg=f"获取股票报价失败: {str(e)}"
-        )
-
-
-@app.post("/api/quote/history_kline")
-async def get_history_kline_enhanced(request: HistoryKLineRequest) -> APIResponse:
-    """获取历史K线（缓存增强）"""
-    try:
-        start_time = time.time()
-        
-        # 调用富途服务获取K线
-        result = await futu_service.get_history_kline(
-            request.code,
-            request.ktype,
-            request.start,
-            request.end,
-            request.max_count
-        )
-        
-        execution_time = time.time() - start_time
-        
-        return APIResponse(
-            ret_code=0,
-            ret_msg="获取历史K线成功",
-            data=result,
-            execution_time=execution_time
-        )
-        
-    except Exception as e:
-        logger.error(f"获取历史K线失败: {e}")
-        return APIResponse(
-            ret_code=-1,
-            ret_msg=f"获取历史K线失败: {str(e)}"
-        )
-
-
-@app.post("/api/analysis/technical_indicators")
-async def get_technical_indicators(request: TechnicalAnalysisRequest) -> Dict[str, Any]:
-    """获取技术分析指标"""
-    try:
-        start_time = time.time()
-        
-        # 创建技术指标计算器
-        tech_indicators = TechnicalIndicators()
-        
-        # 计算指标
-        result = await tech_indicators.calculate_indicators(
-            request.code,
-            request.indicators,
-            request.ktype,
-            request.period
-        )
-        
-        execution_time = time.time() - start_time
-        
-        return {
-            "ret_code": 0,
-            "ret_msg": "技术指标计算成功",
-            "data": result,
-            "execution_time": execution_time
-        }
-        
-    except Exception as e:
-        logger.error(f"技术指标计算失败: {e}")
-        return {
-            "ret_code": -1,
-            "ret_msg": f"技术指标计算失败: {str(e)}"
-        }
-
-
-@app.get("/api/cache/status")
-async def get_cache_status(detailed: bool = False) -> Dict[str, Any]:
-    """获取缓存状态"""
-    try:
-        if cache_manager:
-            result = await cache_manager.get_cache_stats(detailed)
-            return {
-                "ret_code": 0,
-                "ret_msg": "获取缓存状态成功",
-                "data": result
-            }
+            stats = await cache_manager.get_cache_stats(detailed=True)
         else:
-            return {
-                "ret_code": -1,
-                "ret_msg": "缓存管理器未初始化"
-            }
-    except Exception as e:
-        logger.error(f"获取缓存状态失败: {e}")
-        return {
-            "ret_code": -1,
-            "ret_msg": f"获取缓存状态失败: {str(e)}"
-        }
+            stats = await cache_manager.get_cache_stats()
+    except TypeError:
+        # 兼容不支持 detailed 参数的实现
+        stats = await cache_manager.get_cache_stats()
+    return {"ret_code": 0, "ret_msg": "OK", "data": stats}
 
 
-# ==================== 基本面搜索工具实现 ====================
-
-async def call_get_fundamental_search(arguments: Dict[str, Any]) -> Dict[str, Any]:
-    """MCP工具：基本面信息搜索"""
+async def call_save_recommendation(arguments: Dict) -> Dict:
+    """保存股票操作建议与依据"""
     try:
-        # 构建搜索请求
-        request_data = {
-            "q": arguments.get("q", ""),
-            "scope": arguments.get("scope", "webpage"),
-            "includeSummary": arguments.get("includeSummary", False),
-            "size": arguments.get("size", 10),
-            "includeRawContent": arguments.get("includeRawContent", False),
-            "conciseSnippet": arguments.get("conciseSnippet", False)
-        }
-        
-        # 调用基本面搜索服务
-        from models.fundamental_models import FundamentalSearchRequest
-        from services.fundamental_service import fundamental_service
-        
-        request = FundamentalSearchRequest(**request_data)
-        response = await fundamental_service.search_fundamental_info(request)
-        
-        return {
-            "ret_code": 0,
-            "ret_msg": "基本面搜索成功",
-            "data": response.dict()
-        }
-        
+        req = RecommendationWriteRequest(**arguments)
     except Exception as e:
-        logger.error(f"MCP基本面搜索失败: {e}")
-        return {
-            "ret_code": -1,
-            "ret_msg": f"基本面搜索失败: {str(e)}",
-            "data": None
-        }
+        return {"ret_code": -1, "ret_msg": f"参数错误: {e}", "data": {}}
+    if recommendation_storage is None:
+        return {"ret_code": -1, "ret_msg": "推荐存储服务未初始化", "data": {}}
+    saved = recommendation_storage.save_recommendation(req.dict())
+    return {"ret_code": 0, "ret_msg": "OK", "data": saved}
 
 
-async def call_get_stock_fundamental(arguments: Dict[str, Any]) -> Dict[str, Any]:
-    """MCP工具：股票基本面搜索"""
+async def call_get_recommendations(arguments: Dict) -> Dict:
+    """查询股票操作建议记录"""
     try:
-        stock_code = arguments.get("stock_code", "")
-        stock_name = arguments.get("stock_name", "")
-        
-        if not stock_code:
-            return {
-                "ret_code": -1,
-                "ret_msg": "股票代码不能为空",
-                "data": None
-            }
-        
-        # 调用股票基本面搜索服务
-        from services.fundamental_service import fundamental_service
-        result = await fundamental_service.search_stock_fundamental(stock_code, stock_name)
-        
-        return result.dict()
-        
+        req = RecommendationQueryRequest(**arguments)
     except Exception as e:
-        logger.error(f"MCP股票基本面搜索失败: {e}")
-        return {
-            "ret_code": -1,
-            "ret_msg": f"股票基本面搜索失败: {str(e)}",
-            "data": None
-        }
-
-
-async def call_read_webpage(arguments: Dict[str, Any]) -> Dict[str, Any]:
-    """MCP工具：网页内容读取"""
-    try:
-        url = arguments.get("url", "")
-        if not url:
-            return {
-                "ret_code": -1,
-                "ret_msg": "网页URL不能为空",
-                "data": None
-            }
-        
-        # 调用网页读取服务
-        from services.fundamental_service import fundamental_service
-        content = await fundamental_service.read_webpage(url)
-        
-        return {
-            "ret_code": 0,
-            "ret_msg": "网页读取成功",
-            "data": {
-                "url": url,
-                "content": content,
-                "content_length": len(content),
-                "api_source": "metaso"
-            }
-        }
-        
-    except Exception as e:
-        logger.error(f"MCP网页读取失败: {e}")
-        return {
-            "ret_code": -1,
-            "ret_msg": f"网页读取失败: {str(e)}",
-            "data": None
-        }
-
-
-async def call_chat_completion(arguments: Dict[str, Any]) -> Dict[str, Any]:
-    """MCP工具：智能问答对话"""
-    try:
-        messages = arguments.get("messages", [])
-        model = arguments.get("model", "fast")
-        stream = arguments.get("stream", True)
-        
-        if not messages:
-            return {
-                "ret_code": -1,
-                "ret_msg": "对话消息不能为空",
-                "data": None
-            }
-        
-        # 调用问答服务
-        from services.fundamental_service import fundamental_service
-        answer = await fundamental_service.chat_completion(messages, model, stream)
-        
-        return {
-            "ret_code": 0,
-            "ret_msg": "问答成功",
-            "data": {
-                "answer": answer,
-                "model": model,
-                "stream": stream,
-                "messages": messages,
-                "api_source": "metaso"
-            }
-        }
-        
-    except Exception as e:
-        logger.error(f"MCP问答失败: {e}")
-        return {
-            "ret_code": -1,
-            "ret_msg": f"问答失败: {str(e)}",
-            "data": None
-        }
-
-
-# ==================== Metaso网页读取工具实现 ====================
-
-async def call_read_webpage(arguments: Dict[str, Any]) -> Dict[str, Any]:
-    """MCP工具：网页内容读取"""
-    try:
-        url = arguments.get("url", "")
-        
-        if not url:
-            return {
-                "ret_code": -1,
-                "ret_msg": "网页URL不能为空",
-                "data": None
-            }
-        
-        # 调用网页读取服务
-        from models.fundamental_models import MetasoReaderRequest
-        
-        request = MetasoReaderRequest(url=url)
-        response = await fundamental_service.read_webpage(request)
-        
-        return {
-            "ret_code": 0,
-            "ret_msg": "网页读取成功",
-            "data": response.dict()
-        }
-        
-    except Exception as e:
-        logger.error(f"MCP网页读取失败: {e}")
-        return {
-            "ret_code": -1,
-            "ret_msg": f"网页读取失败: {str(e)}",
-            "data": None
-        }
-
-
-# ==================== Metaso问答工具实现 ====================
-
-async def call_chat_completion(arguments: Dict[str, Any]) -> Dict[str, Any]:
-    """MCP工具：智能问答对话"""
-    try:
-        messages = arguments.get("messages", [])
-        model = arguments.get("model", "fast")
-        stream = arguments.get("stream", True)
-        
-        if not messages:
-            return {
-                "ret_code": -1,
-                "ret_msg": "对话消息不能为空",
-                "data": None
-            }
-        
-        # 调用问答服务
-        answer = await fundamental_service.chat_completion(messages, model, stream)
-        
-        return {
-            "ret_code": 0,
-            "ret_msg": "问答成功",
-            "data": {
-                "answer": answer,
-                "model": model,
-                "stream": stream,
-                "messages": messages,
-                "api_source": "metaso"
-            }
-        }
-        
-    except Exception as e:
-        logger.error(f"MCP问答失败: {e}")
-        return {
-            "ret_code": -1,
-            "ret_msg": f"问答失败: {str(e)}",
-            "data": None
-        }
-
-
-# ==================== 火山引擎Kimi对话工具实现 ====================
-
-async def call_get_kimi_chat(arguments: Dict[str, Any]) -> Dict[str, Any]:
-    """MCP工具：火山引擎Kimi对话"""
-    try:
-        messages = arguments.get("messages", [])
-        model = arguments.get("model", "kimi-k2-250905")
-        temperature = arguments.get("temperature", 0.7)
-        max_tokens = arguments.get("max_tokens", 2048)
-        
-        if not messages:
-            return {
-                "ret_code": -1,
-                "ret_msg": "对话消息不能为空",
-                "data": None
-            }
-        
-        # 构建Kimi请求
-        from models.kimi_models import KimiChatRequest, KimiChatMessage
-        
-        kimi_messages = [
-            KimiChatMessage(role=msg["role"], content=msg["content"])
-            for msg in messages
-        ]
-        
-        request = KimiChatRequest(
-            messages=kimi_messages,
-            model=model,
-            temperature=temperature,
-            max_tokens=max_tokens
-        )
-        
-        # 调用Kimi服务
-        response = await kimi_service.chat_completion(request)
-        
-        return {
-            "ret_code": 0,
-            "ret_msg": "Kimi对话成功",
-            "data": {
-                "response": response.dict(),
-                "model": model,
-                "temperature": temperature,
-                "max_tokens": max_tokens,
-                "messages": messages,
-                "api_source": "volces_kimi"
-            }
-        }
-        
-    except Exception as e:
-        logger.error(f"MCP Kimi对话失败: {e}")
-        return {
-            "ret_code": -1,
-            "ret_msg": f"Kimi对话失败: {str(e)}",
-            "data": None
-        }
-
-
-# ==================== 启动入口 ====================
-if __name__ == "__main__":
-    logger.info("🚀 启动富途MCP增强服务...")
-    uvicorn.run(
-        "main_enhanced_mcp_fixed:app",
-        host="0.0.0.0",
-        port=8001,
-        reload=False,
-        log_level="info"
-    )
+        return {"ret_code": -1, "ret_msg": f"参数错误: {e}", "data": []}
+    if recommendation_storage is None:
+        return {"ret_code": -1, "ret_msg": "推荐存储服务未初始化", "data": []}
+    items = recommendation_storage.get_recommendations(req.dict())
+    return {"ret_code": 0, "ret_msg": "OK", "data": items}

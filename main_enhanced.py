@@ -6,17 +6,23 @@
 
 import asyncio
 import time
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Any
+import secrets
+import json
+from pathlib import Path
+from datetime import datetime, timedelta, timezone, time as dtime
+from email.utils import parsedate_to_datetime
+from typing import Dict, List, Optional, Any, Tuple
+from pydantic import BaseModel, Field
+from collections import defaultdict
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger as log  # Use alias to avoid conflicts
 from contextlib import asynccontextmanager
 from futu import *
-from fastapi_mcp import FastApiMCP
 from fastapi import Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse, StreamingResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 
 # Ensure we use loguru logger after futu import
 logger = log
@@ -33,18 +39,38 @@ from analysis.technical_indicators import TechnicalIndicators, TechnicalData, In
 # 导入基本面搜索服务
 from services.fundamental_service import fundamental_service
 from models.fundamental_models import FundamentalSearchRequest, FundamentalSearchResponse
+from services.recommendation_storage import RecommendationStorageService
+from models.recommendation_models import RecommendationWriteRequest, RecommendationQueryRequest, RecommendationUpdateRequest, RecommendationReevaluateRequest
+from models.dashboard_models import DashboardSessionRequest, DashboardSessionResponse, DashboardSessionItem
+from services.dashboard_stream import DashboardStreamManager
+from services.dashboard_session_store import DashboardSessionStore
+from services.deepseek_service import DeepSeekService
+from services.fundamental_storage import FundamentalNewsStorage
+from services.minute_kline_storage import MinuteKlineStorage
+from services.multi_model_service import MultiModelAnalysisService
+from services.strategy_monitor import StrategyMonitorService
 
 # 全局变量
 futu_service: Optional[FutuService] = None
 cache_manager: Optional[DataCacheManager] = None
+recommendation_storage: Optional[RecommendationStorageService] = None
+deepseek_service: Optional[DeepSeekService] = None
+fundamental_storage: Optional[FundamentalNewsStorage] = None
 _server_ready = False
-_mcp_initialized = False  # 新增MCP初始化状态标志
+dashboard_sessions: Dict[str, Dict[str, Any]] = {}
+_dashboard_lock = asyncio.Lock()
+dashboard_stream_manager: Optional[DashboardStreamManager] = None
+dashboard_session_store: Optional[DashboardSessionStore] = None
+minute_kline_storage: Optional[MinuteKlineStorage] = None
+multi_model_service: Optional[MultiModelAnalysisService] = None
+strategy_monitor: Optional[StrategyMonitorService] = None
+DASHBOARD_DIST_PATH = Path("web/dashboard-app/dist")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期管理"""
-    global futu_service, cache_manager, _server_ready, _mcp_initialized
+    global futu_service, cache_manager, recommendation_storage, dashboard_stream_manager, dashboard_session_store, _server_ready, deepseek_service, fundamental_storage, minute_kline_storage, multi_model_service, strategy_monitor
     
     logger.info("🚀 启动增强版MCP Futu服务...")
     
@@ -58,6 +84,21 @@ async def lifespan(app: FastAPI):
         )
         cache_manager = DataCacheManager(cache_config)
         logger.info("✅ 缓存管理器初始化成功")
+        
+        recommendation_storage = RecommendationStorageService(db_path="data/recommendations.db")
+        logger.info("✅ 策略建议存储服务初始化成功")
+        dashboard_session_store = DashboardSessionStore(path="data/dashboard_sessions.json")
+        logger.info("✅ 看板会话存储初始化成功")
+        fundamental_storage = FundamentalNewsStorage(db_path="data/fundamental_news.db")
+        logger.info("✅ 基本面资讯存储初始化成功")
+        minute_kline_storage = MinuteKlineStorage(db_path="data/minute_kline.db")
+        logger.info("✅ 分钟级K线存储初始化成功")
+        if settings.deepseek_api_key:
+            deepseek_service = DeepSeekService(settings.deepseek_api_key)
+            logger.info("✅ DeepSeek分析服务已启用")
+        else:
+            logger.warning("⚠️ DeepSeek API KEY 未配置，基本面高级分析不可用")
+        multi_model_service = MultiModelAnalysisService(deepseek_service)
         
         # 初始化富途服务
         futu_service = FutuService()
@@ -76,26 +117,39 @@ async def lifespan(app: FastAPI):
         else:
             logger.warning("⚠️  富途OpenD连接失败，部分功能可能不可用")
         
+        if dashboard_session_store:
+            loaded_sessions = await asyncio.to_thread(dashboard_session_store.load)
+            async with _dashboard_lock:
+                for session_id, info in loaded_sessions.items():
+                    info.setdefault("history", [])
+                    dashboard_sessions[session_id] = info
+            logger.info(f"✅ 已恢复 {len(loaded_sessions)} 个看板会话")
+        
+        try:
+            loop = asyncio.get_running_loop()
+            dashboard_stream_manager = DashboardStreamManager(futu_service, loop, minute_kline_storage)
+            if dashboard_sessions:
+                for session_id, info in dashboard_sessions.items():
+                    code = info.get("code")
+                    if code:
+                        dashboard_stream_manager.register_session(session_id, code)
+                unique_codes = {sess["code"] for sess in dashboard_sessions.values() if sess.get("code")}
+                for code in unique_codes:
+                    await dashboard_stream_manager.ensure_code_subscription(code)
+            dashboard_stream_manager.start_guard()
+        except RuntimeError:
+            logger.warning("未获取到事件循环，dashboard流功能不可用")
+        
+        strategy_monitor = StrategyMonitorService(futu_service, recommendation_storage)
+        await strategy_monitor.start()
+
         # 等待服务完全初始化
         await asyncio.sleep(3)
         
-        # 创建并配置MCP服务 - 移到这里，确保在服务初始化后
-        mcp = FastApiMCP(
-            app,
-            name="富途证券增强版MCP服务",
-            description="增强版富途证券API服务，集成15+技术指标、智能缓存系统、专业量化分析功能。支持港股、美股、A股实时报价，K线数据，技术分析指标计算，智能缓存优化，交易历史查询等功能。注意：持仓历史需通过历史成交数据计算。"
-        )
-        
-        # 挂载MCP服务到FastAPI应用
-        mcp.mount()
-        
-        # 增加额外的等待时间确保MCP完全初始化
-        logger.info("🔄 等待 MCP 服务器完全初始化...")
-        await asyncio.sleep(8)  # 增加等待时间到8秒
-        
         _server_ready = True
-        _mcp_initialized = True
-        logger.info("✅ 增强版 MCP 服务器初始化完成")
+        logger.info("✅ Web API 服务初始化完成 (MCP 已拆分为独立进程)")
+        if settings.external_mcp_endpoint:
+            logger.info(f"📡 外部 MCP 访问地址: {settings.external_mcp_endpoint}")
             
         yield
         
@@ -106,9 +160,11 @@ async def lifespan(app: FastAPI):
     finally:
         # 清理资源
         _server_ready = False
-        _mcp_initialized = False
         if futu_service:
             await futu_service.disconnect()
+        if strategy_monitor:
+            await strategy_monitor.stop()
+        minute_kline_storage = None
         logger.info("🔥 服务已停止")
 
 
@@ -120,6 +176,11 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+if DASHBOARD_DIST_PATH.exists():
+    app.mount("/assets", StaticFiles(directory=DASHBOARD_DIST_PATH / "assets"), name="dashboard_assets")
+    if (DASHBOARD_DIST_PATH / "vite.svg").exists():
+        app.mount("/vite.svg", StaticFiles(directory=DASHBOARD_DIST_PATH), name="dashboard_vite")
+
 # CORS配置
 app.add_middleware(
     CORSMiddleware,
@@ -129,34 +190,45 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-@app.middleware("http")
-async def _mcp_init_guard(request: Request, call_next):
-    # MCP 就绪守卫：在 MCP 初始化完成前，拦截 /mcp 相关访问
-    global _mcp_initialized
-    path = request.url.path
-    if path.startswith("/mcp") and not _mcp_initialized:
-        return JSONResponse(
-            status_code=503,
-            content={"error": "MCP服务正在初始化中，请稍后重试", "mcp_ready": False}
-        )
-    return await call_next(request)
 
+@app.get("/web/dashboard", include_in_schema=False)
+async def dashboard_page():
+    """返回前端仪表板页面"""
+    if DASHBOARD_DIST_PATH.exists():
+        dist_index = DASHBOARD_DIST_PATH / "index.html"
+        if dist_index.exists():
+            return FileResponse(dist_index)
+    file_path = Path("web/dashboard.html")
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="dashboard page not found")
+    return FileResponse(file_path)
+
+
+@app.get("/web", include_in_schema=False)
+async def dashboard_home():
+    """可视化首页"""
+    if DASHBOARD_DIST_PATH.exists():
+        dist_index = DASHBOARD_DIST_PATH / "index.html"
+        if dist_index.exists():
+            return FileResponse(dist_index)
+    file_path = Path("web/index.html")
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="home page not found")
+    return FileResponse(file_path)
 
 # ==================== 启动事件处理 ====================
 @app.on_event("startup")
 async def startup_event():
     """应用启动事件 - 确保MCP完全初始化"""
-    global _server_ready, _mcp_initialized
+    global _server_ready
     
     # 等待额外的初始化时间
     await asyncio.sleep(2)
     
     if not _server_ready:
         logger.warning("⚠️  服务器初始化延迟，请稍后重试连接")
-    elif not _mcp_initialized:
-        logger.warning("⚠️  MCP服务初始化延迟，请稍后重试连接")
     else:
-        logger.info("✅ 服务器和MCP服务都已就绪")
+        logger.info("✅ Web API 服务已就绪")
 
 
 # ==================== 健康检查 ====================
@@ -169,7 +241,10 @@ async def health_check():
         "status": "healthy" if _server_ready else "degraded",
         "futu_connected": _server_ready,
         "cache_available": cache_manager is not None,
-        "mcp_ready": _mcp_initialized,
+        "mcp_proxy": {
+            "mode": "external",
+            "endpoint": settings.external_mcp_endpoint
+        },
         "metaso_configured": settings.metaso_api_key is not None,
         "kimi_configured": settings.kimi_api_key is not None,
         "timestamp": datetime.now().isoformat(),
@@ -179,13 +254,230 @@ async def health_check():
 @app.get("/mcp/status")
 async def mcp_status():
     """MCP状态检查：让客户端在连接前确认就绪"""
+    ready = settings.external_mcp_endpoint is not None
     return {
-        "mcp_ready": _mcp_initialized,
+        "mcp_ready": ready,
         "server_ready": _server_ready,
-        "can_accept_connections": _mcp_initialized and _server_ready,
+        "mode": "external",
+        "external_endpoint": settings.external_mcp_endpoint,
+        "can_accept_connections": ready,
         "timestamp": datetime.now().isoformat(),
-        "message": "MCP服务就绪" if _mcp_initialized else "MCP服务正在初始化中，请稍候"
+        "message": "MCP服务已拆分为独立进程，请直接连接 external_endpoint"
     }
+
+
+@app.api_route("/mcp{extra_path:path}", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"])
+async def mcp_redirect(extra_path: str, request: Request):
+    """将旧的 /mcp 请求重定向到独立的 MCP 服务"""
+    if not settings.external_mcp_endpoint:
+        raise HTTPException(status_code=503, detail="MCP服务未配置，请联系管理员")
+    suffix = extra_path or ""
+    if suffix and not suffix.startswith("/"):
+        suffix = "/" + suffix
+    target = settings.external_mcp_endpoint.rstrip("/") + suffix
+    return RedirectResponse(url=target, status_code=307)
+
+
+# ==================== 综合分析接口 ====================
+@app.post("/api/analysis/snapshot",
+          operation_id="get_analysis_snapshot",
+          summary="获取股票综合分析快照",
+          tags=["analysis"])
+async def get_analysis_snapshot(request: AnalysisSnapshotRequest) -> Dict[str, Any]:
+    """返回单支股票的全量分析快照，用于 MCP/Agent 快速读取"""
+    code = request.code
+    logger.info(f"[analysis.snapshot] code={code} start")
+    start = time.time()
+
+    def _noop(result=None):
+        return asyncio.create_task(asyncio.sleep(0, result=result))
+
+    quote_task = asyncio.create_task(_fetch_quote_snapshot(code))
+    signals_task = asyncio.create_task(_fetch_news_signals(code, 12)) if request.include_signals else _noop({})
+    rec_task = asyncio.create_task(_fetch_recommendations_snapshot(code)) if request.include_recommendations else _noop([])
+    holding_task = asyncio.create_task(_fetch_holding_snapshot(code)) if request.include_holding else _noop(None)
+
+    if request.include_history and futu_service:
+        history_task = asyncio.create_task(
+            futu_service.get_history_kline(
+                HistoryKLineRequest(
+                    code=code,
+                    ktype=request.history_ktype,
+                    max_count=request.history_points
+                )
+            )
+        )
+    else:
+        history_task = _noop()
+
+    if request.include_capital_flow and futu_service:
+        flow_task = asyncio.create_task(
+            futu_service.get_capital_flow(
+                CapitalFlowRequest(code=code, period_type=PeriodType.DAY)
+            )
+        )
+    else:
+        flow_task = _noop()
+
+    if request.include_capital_distribution and futu_service:
+        distribution_task = asyncio.create_task(
+            futu_service.get_capital_distribution(CapitalDistributionRequest(code=code))
+        )
+    else:
+        distribution_task = _noop()
+
+    if request.include_technicals:
+        technical_req = TechnicalAnalysisRequest(
+            code=code,
+            period=request.technical_period,
+            indicators=request.technical_indicators
+        )
+        technical_task = asyncio.create_task(get_technical_indicators(technical_req))
+    else:
+        technical_task = _noop()
+
+    (quote, signals, recommendations, holding,
+     history_resp, flow_resp, distribution_resp, technical_resp) = await asyncio.gather(
+        quote_task, signals_task, rec_task, holding_task,
+        history_task, flow_task, distribution_task, technical_task
+    )
+
+    snapshot: Dict[str, Any] = {
+        "code": code,
+        "generated_at": datetime.now().isoformat(),
+        "quote": quote,
+        "session_window": _get_session_window(code)
+    }
+
+    if request.include_signals and signals:
+        snapshot["signals"] = signals
+    if request.include_recommendations and recommendations:
+        snapshot["recommendations"] = recommendations
+    if request.include_holding and holding:
+        snapshot["holding"] = holding
+    if request.include_history and isinstance(history_resp, APIResponse) and history_resp.ret_code == 0:
+        snapshot["history_kline"] = history_resp.data.get("kline_data")
+    if request.include_capital_flow and isinstance(flow_resp, APIResponse) and flow_resp.ret_code == 0:
+        snapshot["capital_flow"] = flow_resp.data
+    if request.include_capital_distribution and isinstance(distribution_resp, APIResponse) and distribution_resp.ret_code == 0:
+        snapshot["capital_distribution"] = distribution_resp.data
+    if request.include_technicals and isinstance(technical_resp, dict) and technical_resp.get("ret_code") == 0:
+        snapshot["technical_indicators"] = technical_resp.get("data")
+        summary = technical_resp.get("data", {}).get("summary") if technical_resp.get("data") else None
+        if summary:
+            snapshot.setdefault("insights", {})["technical_summary"] = summary
+
+    if signals:
+        bullish = len(signals.get("bullish", []))
+        bearish = len(signals.get("bearish", []))
+        neutral = len(signals.get("neutral", []))
+        snapshot.setdefault("insights", {}).update({
+            "signal_bullish": bullish,
+            "signal_bearish": bearish,
+            "signal_neutral": neutral
+        })
+    if recommendations:
+        snapshot.setdefault("insights", {})["recommendation_count"] = len(recommendations)
+    if quote:
+        snapshot.setdefault("insights", {})["last_price"] = quote.get("price") or quote.get("cur_price")
+
+    cost = time.time() - start
+    snapshot["execution_time"] = cost
+    logger.info(f"[analysis.snapshot.done] code={code} cost={cost:.3f}s")
+    return snapshot
+
+
+class MultiModelAnalysisRequest(BaseModel):
+    code: str = Field(..., description="股票代码, 如 HK.00700")
+    models: List[str] = Field(default_factory=lambda: ["deepseek", "kimi"], description="参与分析的模型列表")
+    judge_model: str = Field("gemini", description="最终评审模型")
+    question: Optional[str] = Field(None, description="额外关注的问题")
+
+
+class SingleModelAnalysisRequest(BaseModel):
+    code: str = Field(..., description="股票代码, 如 HK.00700")
+    model: str = Field(..., description="需要调用的模型: deepseek/kimi/gemini")
+    question: Optional[str] = Field(None, description="额外问题")
+
+
+class MultiModelJudgeRequest(BaseModel):
+    code: str = Field(..., description="股票代码, 如 HK.00700")
+    judge_model: str = Field("gemini", description="评审模型, 例如 gemini/deepseek")
+    base_results: List[Dict[str, Any]] = Field(..., description="各模型的原始结果")
+    question: Optional[str] = Field(None, description="额外问题")
+
+
+class FundamentalNewsRefreshRequest(BaseModel):
+    code: str = Field(..., description="股票代码, 如 HK.00700")
+    size: int = Field(10, ge=10, le=100, description="Metaso 搜索数量")
+
+
+@app.post("/api/analysis/multi_model",
+          operation_id="run_multi_model_analysis",
+          summary="多模型并行策略分析",
+          tags=["analysis"])
+async def run_multi_model_analysis(request: MultiModelAnalysisRequest) -> Dict[str, Any]:
+    if not _server_ready:
+        raise HTTPException(status_code=503, detail="服务器正在初始化中")
+    if not multi_model_service:
+        raise HTTPException(status_code=503, detail="多模型分析服务不可用")
+    snapshot = await get_analysis_snapshot(AnalysisSnapshotRequest(code=request.code))
+    context_text = _build_analysis_context_text(snapshot)
+    result = await multi_model_service.run_analysis(
+        code=request.code,
+        models=request.models,
+        judge_model=request.judge_model,
+        context_text=context_text,
+        context_snapshot=snapshot,
+        question=request.question,
+    )
+    return result
+
+
+@app.post(
+    "/api/analysis/multi_model/model",
+    operation_id="run_single_model_analysis",
+    summary="单模型策略分析",
+    tags=["analysis"],
+)
+async def run_single_model_analysis(request: SingleModelAnalysisRequest) -> Dict[str, Any]:
+    if not _server_ready or not multi_model_service:
+        raise HTTPException(status_code=503, detail="多模型分析服务不可用")
+    snapshot = await get_analysis_snapshot(AnalysisSnapshotRequest(code=request.code))
+    context_text = _build_analysis_context_text(snapshot)
+    context_snapshot = dict(snapshot)
+    context_snapshot["context_text"] = context_text
+    result = await multi_model_service.run_single_analysis(
+        code=request.code,
+        model=request.model,
+        context_text=context_text,
+        question=request.question,
+    )
+    return {**result, "context_snapshot": context_snapshot}
+
+
+@app.post(
+    "/api/analysis/multi_model/judge",
+    operation_id="run_multi_model_judge",
+    summary="多模型评审整合",
+    tags=["analysis"],
+)
+async def run_multi_model_judge(request: MultiModelJudgeRequest) -> Dict[str, Any]:
+    if not _server_ready or not multi_model_service:
+        raise HTTPException(status_code=503, detail="多模型分析服务不可用")
+    snapshot = await get_analysis_snapshot(AnalysisSnapshotRequest(code=request.code))
+    context_text = _build_analysis_context_text(snapshot)
+    context_snapshot = dict(snapshot)
+    context_snapshot["context_text"] = context_text
+    judge = await multi_model_service.run_judge_only(
+        code=request.code,
+        judge_model=request.judge_model,
+        context_text=context_text,
+        base_results=request.base_results,
+        question=request.question,
+    )
+    judge["context_snapshot"] = context_snapshot
+    return judge
 
 
 # ==================== 时间相关接口 ====================
@@ -314,6 +606,465 @@ def _get_next_trading_day(current_time: datetime) -> datetime:
     return next_day
 
 
+async def _persist_dashboard_sessions():
+    if not dashboard_session_store:
+        return
+    snapshot = {}
+    async with _dashboard_lock:
+        for session_id, info in dashboard_sessions.items():
+            snapshot[session_id] = {
+                "code": info.get("code"),
+                "nickname": info.get("nickname"),
+                "created_at": info.get("created_at")
+            }
+    await asyncio.to_thread(dashboard_session_store.save, snapshot)
+
+
+def _remove_duplicate_sessions_locked() -> List[Tuple[str, str]]:
+    """必须在持有_dashboard_lock时调用，按code去重并返回移除记录(session_id, code)"""
+    seen_codes = set()
+    duplicates: List[Tuple[str, str]] = []
+    for session_id, info in list(dashboard_sessions.items()):
+        code = info.get("code")
+        if not code:
+            continue
+        if code in seen_codes:
+            duplicates.append((session_id, code))
+            dashboard_sessions.pop(session_id, None)
+        else:
+            seen_codes.add(code)
+    return duplicates
+
+
+def _get_session_window(code: str) -> Dict[str, Any]:
+    market = "HK" if code.upper().startswith("HK.") else "US"
+    tz_offset = 8 if market == "HK" else -5
+    tz = timezone(timedelta(hours=tz_offset))
+    today_local = datetime.now(tz).date()
+
+    def local_iso(hour: int, minute: int) -> str:
+        dt = datetime.combine(today_local, dtime(hour=hour, minute=minute, tzinfo=tz))
+        return dt.astimezone(timezone.utc).isoformat()
+
+    if market == "HK":
+        window = {
+            "market": "HK",
+            "open_time": local_iso(9, 30),
+            "break_start": local_iso(12, 0),
+            "break_end": local_iso(13, 0),
+            "close_time": local_iso(16, 0),
+        }
+    else:
+        window = {
+            "market": market,
+            "open_time": local_iso(9, 30),
+            "close_time": local_iso(16, 0),
+        }
+    return window
+
+
+BULLISH_KEYWORDS = ["上涨", "利好", "增持", "创新高", "超预期", "大幅增长", "获批", "回购", "上调"]
+BULLISH_KEYWORDS = [...]
+BULLISH_KEYWORDS = ["上涨", "利好", "增持", "创新高", "超预期", "大幅增长", "获批", "回购", "上调"]
+BEARISH_KEYWORDS = ["下跌", "利空", "警告", "亏损", "裁员", "大幅减少", "下调", "减持", "停牌"]
+
+
+def _normalize_datetime(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _parse_publish_time(value: Any) -> Optional[datetime]:
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return _normalize_datetime(value)
+    if isinstance(value, (int, float)):
+        try:
+            ts = float(value)
+            if ts > 1_000_000_000_000:
+                ts = ts / 1000.0
+            return datetime.fromtimestamp(ts, tz=timezone.utc)
+        except Exception:
+            return None
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return None
+        try:
+            if raw.endswith("Z"):
+                raw = raw[:-1] + "+00:00"
+            return _normalize_datetime(datetime.fromisoformat(raw))
+        except Exception:
+            pass
+        try:
+            dt = parsedate_to_datetime(raw)
+            return _normalize_datetime(dt)
+        except Exception:
+            pass
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S", "%Y-%m-%d"):
+            try:
+                dt = datetime.strptime(raw, fmt)
+                return _normalize_datetime(dt)
+            except Exception:
+                continue
+    return None
+
+
+def _ensure_dashboard_session(session_id: str) -> Dict[str, Any]:
+    session = dashboard_sessions.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="dashboard session not found")
+    return session
+
+
+async def _fetch_quote_snapshot(code: str) -> Optional[Dict[str, Any]]:
+    if not futu_service:
+        logger.warning(f"[quote.snapshot] futu_service_unavailable code={code}")
+        return None
+    request = StockQuoteRequest(code_list=[code])
+    result = await futu_service.get_stock_quote(request)
+    if result.ret_code != 0 or not result.data:
+        logger.warning(f"[quote.snapshot] ret={result.ret_code} empty={not bool(result.data)} code={code}")
+        return None
+    quotes = result.data.get("quotes") or []
+    if not quotes:
+        logger.warning(f"[quote.snapshot] no_quotes code={code}")
+        return None
+    raw = quotes[0]
+
+    def _to_float(value: Any) -> Optional[float]:
+        if value in ("", None):
+            return None
+        if isinstance(value, (int, float)):
+            try:
+                as_float = float(value)
+                if as_float != as_float:  # NaN
+                    return None
+                return as_float
+            except (TypeError, ValueError):
+                return None
+        if isinstance(value, str):
+            cleaned = value.strip()
+            if not cleaned or cleaned in {"--", "N/A", "null", "-"}:
+                return None
+            cleaned = cleaned.replace(",", "")
+            try:
+                if cleaned.endswith("%"):
+                    cleaned = cleaned.rstrip("%")
+                return float(cleaned)
+            except ValueError:
+                return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    try:
+        last_price = _to_float(raw.get("last_price") or raw.get("price"))
+        prev_close = _to_float(raw.get("prev_close_price") or raw.get("prev_close"))
+        change_rate = _to_float(raw.get("change_rate"))
+        open_price = _to_float(raw.get("open_price") or raw.get("open"))
+        high_price = _to_float(raw.get("high_price") or raw.get("high"))
+        low_price = _to_float(raw.get("low_price") or raw.get("low"))
+        volume = _to_float(raw.get("volume"))
+        turnover = _to_float(raw.get("turnover"))
+        change_value = None
+        if last_price is not None and prev_close is not None:
+            change_value = last_price - prev_close
+            if (change_rate is None or change_rate == 0) and prev_close:
+                try:
+                    change_rate = (change_value / prev_close) * 100
+                except ZeroDivisionError:
+                    change_rate = None
+        return {
+            "code": raw.get("code"),
+            "name": raw.get("stock_name") or raw.get("name"),
+            "price": last_price,
+            "last_price": last_price,
+            "change_rate": change_rate,
+            "change_value": change_value,
+            "open": open_price,
+            "high": high_price,
+            "low": low_price,
+            "prev_close": prev_close,
+            "volume": volume,
+            "turnover": turnover,
+            "update_time": raw.get("update_time")
+        }
+    except Exception:
+        return raw
+
+
+async def _fetch_recommendations_snapshot(code: str) -> List[Dict[str, Any]]:
+    if not recommendation_storage:
+        return []
+    req = RecommendationQueryRequest(code=code, limit=5)
+    return await asyncio.to_thread(recommendation_storage.get_recommendations, req.dict())
+
+
+async def _fetch_holding_snapshot(code: str) -> Optional[Dict[str, Any]]:
+    if not futu_service or not futu_service.has_trade_connection():
+        return None
+    try:
+        request = PositionListRequest(code=code, trd_env=TrdEnv.REAL)
+        result = await futu_service.get_position_list(request)
+        if result.ret_code != 0 or not result.data:
+            return None
+        positions = result.data.get("position_list") or []
+        if not positions:
+            return None
+        pos = positions[0]
+        qty = float(pos.get("qty") or 0)
+        cost_price = float(pos.get("cost_price") or 0)
+        last_price = pos.get("price") or pos.get("last_price")
+        if last_price in (None, "", 0) and futu_service:
+            quote = await _fetch_quote_snapshot(code)
+            if quote and quote.get("price") is not None:
+                last_price = quote["price"]
+        last_price = float(last_price or 0)
+        pl_val = float(pos.get("pl_val") or 0)
+        pl_ratio = float(pos.get("pl_ratio") or 0)  # already percent
+        return {
+            "持仓": qty,
+            "成本": cost_price,
+            "现价": last_price,
+            "盈亏": pl_val,
+            "盈亏比例": pl_ratio,
+        }
+    except Exception as exc:
+        logger.debug(f"获取持仓失败: {exc}")
+        return None
+
+
+async def _fetch_news_signals(code: str, size: int = 12) -> Dict[str, List[Dict[str, Any]]]:
+    signals = {"bullish": [], "bearish": [], "neutral": []}
+    if not fundamental_service.is_configured():
+        return signals
+
+    def _build_code_tokens(symbol: str) -> List[str]:
+        base = symbol.upper()
+        tokens = {base}
+        if "." in base:
+            market, num = base.split(".", 1)
+            tokens.update({num, num.lstrip("0") or num, f"{market}{num}", f"{market}{num.lstrip('0') or num}", f"{num}.{market}", f"{num.lstrip('0') or num}.{market}"})
+        tokens.update({base.replace(".", ""), base.replace(".", " ")})
+        return [token for token in tokens if token]
+
+    code_tokens = _build_code_tokens(code)
+
+    def _is_related_article(record: Dict[str, Any], analysis: Optional[Dict[str, Any]]) -> bool:
+        if analysis and "related" in analysis:
+            related_val = analysis.get("related")
+            if isinstance(related_val, bool):
+                return related_val
+            if isinstance(related_val, (int, float)):
+                return related_val >= 0.5
+        title = (record.get("title") or "").upper()
+        snippet = (record.get("snippet") or "").upper()
+        merged = f"{title} {snippet}"
+        for token in code_tokens:
+            if token and token in merged:
+                return True
+        return False
+
+    def _fallback_analysis(text: str) -> Dict[str, Any]:
+        lowered = text.lower()
+        sentiment = "neutral"
+        if any(key.lower() in lowered for key in BEARISH_KEYWORDS):
+            sentiment = "bearish"
+        elif any(key.lower() in lowered for key in BULLISH_KEYWORDS):
+            sentiment = "bullish"
+        return {
+            "sentiment": sentiment,
+            "confidence": 0.4,
+            "impact_horizon": "短期",
+            "volatility_bias": "中性",
+            "themes": [],
+            "risk_factors": [],
+            "opportunity_factors": [],
+            "summary": text[:100],
+            "action_hint": "",
+            "related": any(token.lower() in text.lower() for token in code_tokens)
+        }
+
+    async def _ensure_analysis(item: Dict[str, Any]) -> Dict[str, Any]:
+        payload = {
+            "code": code,
+            "title": item.get("title"),
+            "snippet": item.get("snippet"),
+            "source": item.get("source"),
+            "publish_time": item.get("publish_time"),
+            "url": item.get("url")
+        }
+        text = f"{payload['title'] or ''} {payload['snippet'] or ''}"
+        analysis: Optional[Dict[str, Any]] = None
+        if deepseek_service and deepseek_service.is_configured():
+            try:
+                analysis = await deepseek_service.analyze_fundamental_news(payload)
+                if analysis is not None:
+                    analysis["analysis_provider"] = "deepseek"
+            except Exception as exc:
+                logger.warning(
+                    f"[fundamental.analysis] DeepSeek 调用失败，使用兜底分析 code={code} title={payload['title']} err={exc}"
+                )
+        if not analysis:
+            detail = None
+            if deepseek_service:
+                detail = getattr(deepseek_service, "last_error_message", None)
+            logger.warning(
+                "[fundamental.analysis] 使用关键词兜底情绪，DeepSeek 无响应或解析失败 code=%s title=%s detail=%s",
+                code,
+                payload["title"],
+                detail or "无",
+            )
+            analysis = _fallback_analysis(text)
+            analysis["analysis_provider"] = "fallback"
+        return analysis
+
+    async def _repair_existing_records(quota: int = 5):
+        if not fundamental_storage or not deepseek_service or not deepseek_service.is_configured():
+            return
+        pending_items = fundamental_storage.get_reanalysis_queue(code, limit=quota)
+        if not pending_items:
+            return
+        logger.info(f"[fundamental.repair] code={code} pending={len(pending_items)} 触发重算")
+        for pending in pending_items:
+            try:
+                analysis = await _ensure_analysis(pending)
+                pending["analysis"] = analysis
+                fundamental_storage.upsert(pending)
+            except Exception as exc:
+                logger.warning(f"[fundamental.repair] 重算失败 code={code} title={pending.get('title')} err={exc}")
+
+    try:
+        request = FundamentalSearchRequest(
+            q=f"{code} 最新 股票新闻 基本面",
+            scope="news",
+            includeSummary=True,
+            size=min(max(size, 10), 100),
+            includeRawContent=False,
+            conciseSnippet=True
+        )
+        response = await fundamental_service.search_fundamental_info(request)
+        results = response.results or []
+        for item in results[:8]:
+            record = {
+                "code": code,
+                "title": item.title,
+                "url": item.url,
+                "source": item.source,
+                "snippet": item.snippet,
+                "publish_time": item.publish_time,
+            }
+            unique_key = None
+            stored = None
+            if fundamental_storage:
+                unique_key = fundamental_storage.make_unique_key(code, item.title or "", item.url or "")
+                stored = fundamental_storage.get_by_unique_key(unique_key)
+            analysis = stored.get("analysis") if stored and stored.get("analysis") else None
+            if not analysis:
+                analysis = await _ensure_analysis(record)
+            if not _is_related_article(record, analysis):
+                logger.info(
+                    "[fundamental.filter] 丢弃非相关新闻 code=%s title=%s", code, record.get("title")
+                )
+                continue
+            record["analysis"] = analysis
+            if fundamental_storage:
+                record["unique_key"] = unique_key
+                fundamental_storage.upsert(record)
+    except Exception as exc:
+        logger.debug(f"基本面增量搜索失败: {exc}")
+
+    refresh_quota = max(3, min(10, max(size // 2, 1)))
+    await _repair_existing_records(quota=refresh_quota)
+
+    stored_records: List[Dict[str, Any]] = []
+    if fundamental_storage:
+        stored_records = fundamental_storage.get_recent_news(code, limit=40)
+        stored_records = [rec for rec in stored_records if _is_related_article(rec, rec.get("analysis"))]
+
+    if not stored_records:
+        return signals
+
+    daily_buckets: Dict[str, Dict[str, Dict[str, float]]] = defaultdict(
+        lambda: {
+            "counts": {"bullish": 0.0, "bearish": 0.0, "neutral": 0.0},
+            "weights": {"bullish": 0.0, "bearish": 0.0, "neutral": 0.0}
+        }
+    )
+
+    for rec in stored_records:
+        analysis = rec.get("analysis") or {}
+        raw_sentiment = analysis.get("sentiment") or "neutral"
+        sentiment = "neutral"
+        if raw_sentiment in ("bullish", "利好", "看涨"):
+            sentiment = "bullish"
+        elif raw_sentiment in ("bearish", "利空", "看跌"):
+            sentiment = "bearish"
+        entry = {
+            "title": rec.get("title"),
+            "snippet": rec.get("snippet"),
+            "source": rec.get("source"),
+            "url": rec.get("url"),
+            "publish_time": rec.get("publish_time"),
+            "published_at": rec.get("publish_time"),
+            "analysis": analysis
+        }
+        signals.setdefault(sentiment, []).append(entry)
+        publish_date = (rec.get("publish_time") or rec.get("last_seen") or "")[:10]
+        if publish_date:
+            bucket = daily_buckets[publish_date]
+            bucket["counts"][sentiment] += 1
+            impact_score = float(analysis.get("impact_score") or 50)
+            novelty_score = float(analysis.get("novelty_score") or analysis.get("magnitude_score") or 50)
+            weight = max(0.1, min((impact_score * 0.7 + novelty_score * 0.3) / 100, 2.0))
+            if analysis.get("effectiveness") == "stale":
+                weight *= 0.3
+            elif analysis.get("effectiveness") == "diminished":
+                weight *= 0.6
+            bucket["weights"][sentiment] += weight
+
+    daily_metrics = []
+    for date, bucket in sorted(daily_buckets.items(), key=lambda x: x[0], reverse=True):
+        counts = bucket["counts"]
+        weights = bucket["weights"]
+        total = counts["bullish"] + counts["bearish"] + counts["neutral"]
+        total_weight = weights["bullish"] + weights["bearish"] + weights["neutral"]
+        if total == 0:
+            continue
+        weight_score = 0.0
+        if total_weight:
+            weight_score = (weights["bullish"] - weights["bearish"]) / total_weight
+        score = (counts["bullish"] - counts["bearish"]) / total
+        daily_metrics.append({
+            "date": date,
+            "bullish": counts["bullish"],
+            "bearish": counts["bearish"],
+            "neutral": counts["neutral"],
+            "score": round(score, 2),
+            "weighted_score": round(weight_score, 2)
+        })
+    signals["daily_metrics"] = daily_metrics
+
+    logger.info(
+        f"[fundamental.signals.deepseek] code={code} bullish={len(signals.get('bullish', []))} "
+        f"bearish={len(signals.get('bearish', []))}"
+    )
+    return signals
+
+
+def _normalize_kline_cache_scope(request: HistoryKLineRequest) -> Tuple[str, str, str]:
+    """生成用于缓存的K线范围标识，避免不同请求互相污染"""
+    ktype_value = request.ktype.value if hasattr(request.ktype, "value") else str(request.ktype)
+    autype_value = request.autype.value if hasattr(request.autype, "value") else str(request.autype)
+    start_token = request.start or f"recent:{request.max_count}"
+    end_token = request.end or "latest"
+    return f"{ktype_value}:{autype_value}", start_token, end_token
+
+
 # ==================== 原有行情接口（增强版） ====================
 @app.post("/api/quote/history_kline",
           operation_id="get_history_kline_enhanced",
@@ -326,12 +1077,13 @@ async def get_history_kline_enhanced(request: HistoryKLineRequest) -> APIRespons
     
     start_time = time.time()
     cache_hit = False
+    ktype_token, cache_start, cache_end = _normalize_kline_cache_scope(request)
     
     try:
         # 1. 尝试从缓存获取数据
         if cache_manager:
             cached_data = await cache_manager.get_kline_data(
-                request.code, request.ktype.value, request.start, request.end
+                request.code, ktype_token, cache_start, cache_end
             )
             if cached_data:
                 cache_hit = True
@@ -355,8 +1107,8 @@ async def get_history_kline_enhanced(request: HistoryKLineRequest) -> APIRespons
         # 3. 存储到缓存
         if result.ret_code == 0 and cache_manager and result.data.get("kline_data"):
             await cache_manager.store_kline_data(
-                request.code, request.ktype.value, 
-                request.start, request.end,
+                request.code, ktype_token,
+                cache_start, cache_end,
                 result.data["kline_data"]
             )
         
@@ -1179,6 +1931,8 @@ async def get_acc_info(request: AccInfoRequest) -> APIResponse:
     """查询账户资金 - 获取账户总资产、现金、购买力等资金信息"""
     if not _server_ready or not futu_service:
         raise HTTPException(status_code=503, detail="服务未就绪")
+    if not futu_service.has_trade_connection():
+        raise HTTPException(status_code=503, detail="交易接口未连接或未解锁，请先在OpenD中开启交易功能")
     
     try:
         return await futu_service.get_acc_info(request)
@@ -1205,6 +1959,8 @@ async def get_position_list(request: PositionListRequest) -> APIResponse:
     """查询持仓列表 - 获取账户所有持仓信息，包含盈亏分析和市场分布"""
     if not _server_ready or not futu_service:
         raise HTTPException(status_code=503, detail="服务未就绪")
+    if not futu_service.has_trade_connection():
+        raise HTTPException(status_code=503, detail="交易接口未连接或未解锁，请先在OpenD中开启交易功能")
     
     try:
         return await futu_service.get_position_list(request)
@@ -1233,6 +1989,8 @@ async def get_history_deal_list(request: HistoryDealListRequest) -> APIResponse:
     """查询历史成交 - 获取账户历史成交记录，包含买卖分析和费用统计"""
     if not _server_ready or not futu_service:
         raise HTTPException(status_code=503, detail="服务未就绪")
+    if not futu_service.has_trade_connection():
+        raise HTTPException(status_code=503, detail="交易接口未连接或未解锁，请先在OpenD中开启交易功能")
     
     try:
         return await futu_service.get_history_deal_list(request)
@@ -1263,6 +2021,8 @@ async def get_deal_list(request: DealListRequest) -> APIResponse:
     """查询当日成交 - 获取账户当日成交记录，包含买卖分析和时间分布"""
     if not _server_ready or not futu_service:
         raise HTTPException(status_code=503, detail="服务未就绪")
+    if not futu_service.has_trade_connection():
+        raise HTTPException(status_code=503, detail="交易接口未连接或未解锁，请先在OpenD中开启交易功能")
     
     try:
         return await futu_service.get_deal_list(request)
@@ -1291,6 +2051,8 @@ async def get_history_order_list(request: HistoryOrderListRequest) -> APIRespons
     """获取历史订单列表"""
     if not _server_ready:
         return APIResponse(ret_code=-1, ret_msg="服务器正在初始化中，请稍后重试", data=None)
+    if not futu_service or not futu_service.has_trade_connection():
+        return APIResponse(ret_code=-1, ret_msg="交易接口未连接或未解锁，请检查OpenD状态后重试", data=None)
     
     try:
         return await futu_service.get_history_order_list(request)
@@ -1317,6 +2079,8 @@ async def get_order_fee_query(request: OrderFeeQueryRequest) -> APIResponse:
     """查询订单费用"""
     if not _server_ready:
         return APIResponse(ret_code=-1, ret_msg="服务器正在初始化中，请稍后重试", data=None)
+    if not futu_service or not futu_service.has_trade_connection():
+        return APIResponse(ret_code=-1, ret_msg="交易接口未连接或未解锁，请检查OpenD状态后重试", data=None)
     
     try:
         return await futu_service.get_order_fee_query(request)
@@ -1344,6 +2108,454 @@ async def get_trade_history(request: HistoryDealListRequest) -> APIResponse:
     return await get_history_deal_list(request)
 
 
+# ==================== MCP实时看板接口 ====================
+@app.post("/api/dashboard/session",
+          operation_id="create_dashboard_session",
+          summary="创建股票实时看板会话",
+          description="生成一个可分享的 Web 看板 URL，用于实时查看指定股票的行情/资讯/策略",
+          tags=["dashboard"])
+async def create_dashboard_session(request: DashboardSessionRequest, http_request: Request) -> DashboardSessionResponse:
+    if not _server_ready:
+        raise HTTPException(status_code=503, detail="服务尚未就绪")
+    session_id = secrets.token_urlsafe(10)
+    async with _dashboard_lock:
+        existing_session_id = None
+        for sid, info in dashboard_sessions.items():
+            if info.get("code") == request.code:
+                existing_session_id = sid
+                if request.nickname:
+                    info["nickname"] = request.nickname
+                break
+        if existing_session_id:
+            dashboard_sessions[existing_session_id].setdefault("history", [])
+            session_id = existing_session_id
+        else:
+            dashboard_sessions[session_id] = {
+                "code": request.code,
+                "nickname": request.nickname,
+                "created_at": datetime.now().isoformat(),
+                "history": []
+            }
+    await _persist_dashboard_sessions()
+    base_url = settings.dashboard_base_url.rstrip("/")
+    url = f"{base_url}/web/dashboard?session={session_id}"
+    if dashboard_stream_manager:
+        dashboard_stream_manager.register_session(session_id, request.code)
+        await dashboard_stream_manager.ensure_code_subscription(code=request.code)
+        dashboard_stream_manager.start_guard()
+    logger.info(f"[dashboard.session.create] session={session_id} code={request.code} nickname={request.nickname} reused={existing_session_id is not None}")
+    return DashboardSessionResponse(session_id=session_id, url=url)
+
+
+@app.get("/api/dashboard/sessions",
+         operation_id="list_dashboard_sessions",
+         summary="列出所有看板会话",
+         tags=["dashboard"])
+async def list_dashboard_sessions() -> Dict[str, Any]:
+    start = time.time()
+    removed_duplicates: List[Tuple[str, str]] = []
+    async with _dashboard_lock:
+        removed_duplicates = _remove_duplicate_sessions_locked()
+        session_items = [
+            DashboardSessionItem(
+                session_id=session_id,
+                code=info.get("code"),
+                nickname=info.get("nickname"),
+                created_at=info.get("created_at"),
+            )
+            for session_id, info in dashboard_sessions.items()
+        ]
+    if removed_duplicates:
+        await _persist_dashboard_sessions()
+        if dashboard_stream_manager:
+            for session_id, code in removed_duplicates:
+                await dashboard_stream_manager.unregister_session(session_id)
+                await dashboard_stream_manager.force_detach_session(session_id)
+        logger.warning(f"[dashboard.sessions.dedup] removed={len(removed_duplicates)} codes={[c for _, c in removed_duplicates]}")
+    quota = None
+    if futu_service:
+        summary = await futu_service.get_subscription_summary()
+        if summary.ret_code == 0 and isinstance(summary.data, dict):
+            raw_quota = summary.data
+            total_used = raw_quota.get("total_used") or raw_quota.get("totalUsed") or raw_quota.get("used") or 0
+            remain = raw_quota.get("remain") or raw_quota.get("remainQuota") or raw_quota.get("remain_count") or 0
+            own_used = raw_quota.get("own_used") or raw_quota.get("ownUsed") or raw_quota.get("self_used") or 0
+            quota = {
+                "total_used": total_used,
+                "remain": remain,
+                "own_used": own_used,
+                "raw": raw_quota
+            }
+        # 获取行情快照 + 最新策略
+        for item in session_items:
+            quote = await _fetch_quote_snapshot(item.code)
+            if quote:
+                item.quote = quote
+            if recommendation_storage:
+                rec_req = RecommendationQueryRequest(code=item.code, limit=1)
+                recs = await asyncio.to_thread(recommendation_storage.get_recommendations, rec_req.dict())
+                if recs:
+                    latest = recs[0]
+                    item.strategy = latest.get("action")
+                    item.last_signal_time = latest.get("created_at")
+    cost = time.time() - start
+    logger.info(f"[dashboard.sessions.list] total={len(session_items)} quota={'y' if quota else 'n'} cost={cost:.3f}s")
+    return {"sessions": [item.model_dump() for item in session_items], "quota": quota}
+
+
+@app.delete("/api/dashboard/session/{session_id}",
+            operation_id="delete_dashboard_session",
+            summary="删除看板会话",
+            tags=["dashboard"])
+async def delete_dashboard_session(session_id: str) -> Dict[str, Any]:
+    async with _dashboard_lock:
+        info = dashboard_sessions.pop(session_id, None)
+    if not info:
+        raise HTTPException(status_code=404, detail="session not found")
+    await _persist_dashboard_sessions()
+    if dashboard_stream_manager:
+        await dashboard_stream_manager.unregister_session(session_id)
+        await dashboard_stream_manager.force_detach_session(session_id)
+    return {"deleted": True, "session_id": session_id, "code": info.get("code")}
+
+
+@app.get("/api/dashboard/bootstrap",
+         operation_id="get_dashboard_bootstrap",
+         summary="获取看板初始数据",
+         tags=["dashboard"])
+async def get_dashboard_bootstrap(session: str) -> Dict[str, Any]:
+    data = _ensure_dashboard_session(session)
+    code = data["code"]
+    start = time.time()
+    logger.info(f"[dashboard.bootstrap] session={session} code={code} fetch_start")
+    quote_task = asyncio.create_task(_fetch_quote_snapshot(code))
+    news_task = asyncio.create_task(_fetch_news_signals(code, 12))
+    rec_task = asyncio.create_task(_fetch_recommendations_snapshot(code))
+    holding_task = asyncio.create_task(_fetch_holding_snapshot(code))
+    start_date = (datetime.now() - timedelta(days=5)).strftime("%Y-%m-%d")
+    if futu_service:
+        flow_task = asyncio.create_task(
+            futu_service.get_capital_flow(CapitalFlowRequest(code=code, period_type=PeriodType.DAY, start=start_date))
+        )
+        distribution_task = asyncio.create_task(
+            futu_service.get_capital_distribution(CapitalDistributionRequest(code=code))
+        )
+        history_task = asyncio.create_task(
+            futu_service.get_history_kline(HistoryKLineRequest(code=code, ktype=KLType.K_1M, max_count=240))
+        )
+        current_task = asyncio.create_task(
+            futu_service.get_current_kline(
+                CurrentKLineRequest(code=code, num=240, ktype=KLType.K_1M, autype=AuType.QFQ)
+            )
+        )
+    else:
+        flow_task = asyncio.create_task(asyncio.sleep(0, result=None))
+        distribution_task = asyncio.create_task(asyncio.sleep(0, result=None))
+        history_task = asyncio.create_task(asyncio.sleep(0, result=None))
+        current_task = asyncio.create_task(asyncio.sleep(0, result=None))
+    quote, signals, recommendations, holding, flow_resp, distribution_resp, history_resp, current_resp = await asyncio.gather(
+        quote_task, news_task, rec_task, holding_task, flow_task, distribution_task, history_task, current_task
+    )
+    history = data.get("history", [])
+    bootstrap = {
+        "code": code,
+        "session": {
+            "session_id": session,
+            "nickname": data.get("nickname"),
+            "created_at": data.get("created_at")
+        },
+        "signals": signals,
+        "recommendations": recommendations,
+        "holding": holding,
+        "history": history[-60:]
+    }
+    session_window = _get_session_window(code)
+    if quote:
+        bootstrap["quote"] = quote
+        if quote.get("prev_close") is not None:
+            session_window["previous_close"] = quote.get("prev_close")
+    if isinstance(flow_resp, APIResponse) and flow_resp.ret_code == 0:
+        bootstrap["capital_flow"] = flow_resp.data
+    if isinstance(distribution_resp, APIResponse) and distribution_resp.ret_code == 0:
+        bootstrap["capital_distribution"] = distribution_resp.data
+    history_data = history_resp.data.get("kline_data") if isinstance(history_resp, APIResponse) and history_resp.ret_code == 0 and history_resp.data else None
+    current_data = current_resp.data.get("kline_data") if isinstance(current_resp, APIResponse) and current_resp.ret_code == 0 and current_resp.data else None
+    merged_kline = _merge_kline_records(history_data, current_data)
+    if minute_kline_storage and merged_kline:
+        try:
+            minute_kline_storage.save_batch(code, merged_kline)
+            minute_kline_storage.delete_older_than(code, keep_limit=2880)
+            stored_recent = minute_kline_storage.fetch_recent(code, limit=720)
+            merged_kline = _merge_kline_records(stored_recent, merged_kline)
+        except Exception as exc:
+            logger.warning(f"分钟K线存储失败: {exc}")
+    if merged_kline:
+        bootstrap["history_kline"] = merged_kline
+    bootstrap["session_window"] = session_window
+    logger.info(
+        f"[dashboard.bootstrap.done] session={session} code={code} "
+        f"quote={'y' if quote else 'n'} signals={len(signals.get('bullish', []))+len(signals.get('bearish', []))} "
+        f"recs={len(recommendations)} holding={'y' if holding else 'n'} cost={time.time()-start:.3f}s"
+    )
+    return bootstrap
+
+
+@app.get("/web/api/stream/{session_id}", include_in_schema=False)
+async def dashboard_stream(session_id: str):
+    session = _ensure_dashboard_session(session_id)
+    code = session["code"]
+    
+    if not dashboard_stream_manager:
+        raise HTTPException(status_code=503, detail="Dashboard流功能不可用")
+    
+    queue = await dashboard_stream_manager.attach_session(session_id, code)
+    
+    async def event_generator():
+        try:
+            logger.info(f"[dashboard.stream.attach] session={session_id} code={code}")
+            while True:
+                payload = await queue.get()
+                history = session.setdefault("history", [])
+                quote = payload.get("quote")
+                if quote:
+                    history.append({"ts": payload.get("timestamp"), "price": quote.get("price")})
+                    if len(history) > 180:
+                        history.pop(0)
+                try:
+                    chunk = json.dumps(payload, ensure_ascii=False)
+                    yield f"data: {chunk}\\n\\n"
+                except Exception as exc:
+                    logger.debug(f"dashboard stream encode error: {exc}")
+        except asyncio.CancelledError:
+            logger.debug("dashboard stream cancelled")
+        except Exception as exc:
+            logger.warning(f"dashboard stream error: {exc}")
+        finally:
+            await dashboard_stream_manager.release_stream(session_id)
+            logger.info(f"[dashboard.stream.detach] session={session_id} code={code}")
+    
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
+# ==================== 策略建议记录接口 ====================
+@app.post("/api/recommendations",
+          operation_id="save_recommendation",
+          summary="保存策略建议",
+          description="记录针对某标的的操作建议、信心、依据等信息，用于后续复盘",
+          tags=["recommendation"])
+async def save_recommendation(request: RecommendationWriteRequest) -> APIResponse:
+    """保存策略建议"""
+    if recommendation_storage is None:
+        return APIResponse(ret_code=-1, ret_msg="策略建议存储服务未初始化", data=None)
+    
+    try:
+        if request.status == "running":
+            has_other = await asyncio.to_thread(recommendation_storage.has_running_strategy, request.code)
+            if has_other:
+                return APIResponse(ret_code=-1, ret_msg="该股票已有执行中的策略", data=None)
+        saved = await asyncio.to_thread(recommendation_storage.save_recommendation, request.dict())
+        if strategy_monitor and request.status == "running" and saved.get("id"):
+            full = await asyncio.to_thread(recommendation_storage.get_recommendation, saved["id"])
+            if full:
+                await strategy_monitor.register_strategy(full)
+        return APIResponse(ret_code=0, ret_msg="策略建议保存成功", data=saved)
+    except Exception as e:
+        logger.error(f"保存策略建议失败: {e}")
+        return APIResponse(ret_code=-1, ret_msg=f"策略建议保存失败: {e}", data=None)
+
+
+@app.post("/api/recommendations/query",
+          operation_id="get_recommendations",
+          summary="查询策略建议",
+          description="按股票代码、操作类型、采纳状态、时间区间等条件检索历史策略建议",
+          tags=["recommendation"])
+async def get_recommendations(request: RecommendationQueryRequest) -> APIResponse:
+    """查询策略建议"""
+    if recommendation_storage is None:
+        return APIResponse(ret_code=-1, ret_msg="策略建议存储服务未初始化", data=None)
+    
+    try:
+        items = await asyncio.to_thread(recommendation_storage.get_recommendations, request.dict())
+        return APIResponse(ret_code=0, ret_msg="查询成功", data={"items": items, "count": len(items)})
+    except Exception as e:
+        logger.error(f"查询策略建议失败: {e}")
+        return APIResponse(ret_code=-1, ret_msg=f"查询策略建议失败: {e}", data=None)
+
+
+@app.get("/api/recommendations/{rec_id}",
+         operation_id="get_recommendation_detail",
+         summary="查询单条策略详情",
+         tags=["recommendation"])
+async def get_recommendation_detail(rec_id: int) -> APIResponse:
+    if recommendation_storage is None:
+        return APIResponse(ret_code=-1, ret_msg="策略建议存储服务未初始化", data=None)
+    try:
+        item = await asyncio.to_thread(recommendation_storage.get_recommendation, rec_id)
+        if not item:
+            raise HTTPException(status_code=404, detail="策略不存在")
+        return APIResponse(ret_code=0, ret_msg="查询成功", data=item)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"查询策略详情失败: {e}")
+        return APIResponse(ret_code=-1, ret_msg=f"查询策略详情失败: {e}", data=None)
+
+
+@app.get("/api/recommendations/{rec_id}/evaluations",
+         operation_id="get_recommendation_evaluations",
+         summary="查询策略评估历史",
+         tags=["recommendation"])
+async def get_recommendation_evaluations(rec_id: int) -> APIResponse:
+    if recommendation_storage is None:
+        return APIResponse(ret_code=-1, ret_msg="策略建议存储服务未初始化", data=None)
+    try:
+        history = await asyncio.to_thread(recommendation_storage.get_evaluations, rec_id)
+        return APIResponse(ret_code=0, ret_msg="查询成功", data={"items": history, "count": len(history)})
+    except Exception as e:
+        logger.error(f"查询策略评估历史失败: {e}")
+        return APIResponse(ret_code=-1, ret_msg=f"查询策略评估历史失败: {e}", data=None)
+
+
+@app.get("/api/recommendations/{rec_id}/alerts",
+         operation_id="get_recommendation_alerts",
+         summary="查询策略盯盘告警",
+         tags=["recommendation"])
+async def get_recommendation_alerts(rec_id: int, limit: int = 50) -> APIResponse:
+    if recommendation_storage is None:
+        return APIResponse(ret_code=-1, ret_msg="策略建议存储服务未初始化", data=None)
+    try:
+        alerts = await asyncio.to_thread(recommendation_storage.get_alerts, rec_id, limit)
+        return APIResponse(ret_code=0, ret_msg="查询成功", data={"items": alerts, "count": len(alerts)})
+    except Exception as e:
+        logger.error(f"查询策略告警失败: {e}")
+        return APIResponse(ret_code=-1, ret_msg=f"查询策略告警失败: {e}", data=None)
+
+
+@app.patch("/api/recommendations/{rec_id}",
+           operation_id="update_recommendation",
+           summary="更新策略建议状态",
+           tags=["recommendation"])
+async def update_recommendation(rec_id: int, request: RecommendationUpdateRequest) -> APIResponse:
+    if recommendation_storage is None:
+        return APIResponse(ret_code=-1, ret_msg="策略建议存储服务未初始化", data=None)
+    try:
+        existing = await asyncio.to_thread(recommendation_storage.get_recommendation, rec_id)
+        if not existing:
+            raise HTTPException(status_code=404, detail="策略不存在")
+        payload = request.dict(exclude_unset=True)
+        new_status = payload.get("status")
+        if new_status == "running":
+            has_other = await asyncio.to_thread(
+                recommendation_storage.has_running_strategy,
+                existing["code"],
+                rec_id,
+            )
+            if has_other:
+                return APIResponse(ret_code=-1, ret_msg="该股票已有执行中的策略", data=None)
+        updated = await asyncio.to_thread(recommendation_storage.update_recommendation, rec_id, payload)
+        if not updated:
+            raise HTTPException(status_code=404, detail="策略不存在")
+        if strategy_monitor:
+            if payload.get("status"):
+                if payload["status"] == "running":
+                    await strategy_monitor.register_strategy(updated)
+                else:
+                    await strategy_monitor.unregister_strategy(rec_id)
+            elif updated.get("status") == "running" and any(
+                key in payload for key in ["monitor_config", "entry_price", "target_price", "stop_loss"]
+            ):
+                await strategy_monitor.register_strategy(updated)
+        return APIResponse(ret_code=0, ret_msg="更新成功", data=updated)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"更新策略失败: {e}")
+        return APIResponse(ret_code=-1, ret_msg=f"更新策略失败: {e}", data=None)
+
+
+@app.post("/api/recommendations/{rec_id}/reevaluate",
+          operation_id="reevaluate_recommendation",
+          summary="重新评估策略",
+          tags=["recommendation"])
+async def reevaluate_recommendation(rec_id: int, request: RecommendationReevaluateRequest) -> APIResponse:
+    if recommendation_storage is None:
+        return APIResponse(ret_code=-1, ret_msg="策略建议存储服务未初始化", data=None)
+    if not _server_ready or not multi_model_service:
+        return APIResponse(ret_code=-1, ret_msg="多模型分析服务不可用", data=None)
+    try:
+        item = await asyncio.to_thread(recommendation_storage.get_recommendation, rec_id)
+        if not item:
+            raise HTTPException(status_code=404, detail="策略不存在")
+        code = item.get("code")
+        if not code:
+            return APIResponse(ret_code=-1, ret_msg="策略缺少股票代码", data=None)
+        snapshot = await get_analysis_snapshot(AnalysisSnapshotRequest(code=code))
+        context_text = _build_analysis_context_text(snapshot)
+        result = await multi_model_service.run_analysis(
+            code=code,
+            models=request.models,
+            judge_model=request.judge_model,
+            context_text=context_text,
+            context_snapshot=snapshot,
+            question=request.question,
+        )
+        quote = result.get("context_snapshot", {}).get("quote") or snapshot.get("quote") or {}
+        current_price = quote.get("price") or quote.get("cur_price")
+        entry_price = item.get("entry_price")
+        pnl_pct = None
+        try:
+            if entry_price is not None and current_price is not None:
+                entry_val = float(entry_price)
+                if entry_val != 0:
+                    pnl_pct = (float(current_price) - entry_val) / entry_val
+        except (TypeError, ValueError):
+            pnl_pct = None
+        summary = (
+            result.get("judge", {}).get("result", {}).get("summary")
+            or "多模型已完成最新评估"
+        )
+        now_iso = datetime.now(timezone.utc).isoformat()
+        update_payload: Dict[str, Any] = {
+            "eval_status": "completed",
+            "eval_summary": summary,
+            "eval_generated_at": now_iso,
+            "eval_pnl_pct": pnl_pct,
+            "eval_detail": {"analysis": result},
+        }
+        updated = await asyncio.to_thread(
+            recommendation_storage.update_recommendation, rec_id, update_payload
+        )
+        history_record = await asyncio.to_thread(
+            recommendation_storage.add_evaluation_record,
+            rec_id,
+            summary=summary,
+            pnl=pnl_pct,
+            detail={"analysis": result} if result else None,
+            models=request.models,
+            judge_model=request.judge_model,
+            created_at=now_iso,
+        )
+        return APIResponse(
+            ret_code=0,
+            ret_msg="重新评估完成",
+            data={
+                "analysis": result,
+                "evaluation": {
+                    "summary": summary,
+                    "generated_at": now_iso,
+                    "pnl_pct": pnl_pct,
+                },
+                "history_record": history_record,
+                "updated": updated,
+            },
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"重新评估策略失败: {e}")
+        return APIResponse(ret_code=-1, ret_msg=f"重新评估策略失败: {e}", data=None)
+
+
 # ==================== 基本面搜索接口 ====================
 
 @app.post("/api/fundamental/search",
@@ -1354,6 +2566,8 @@ async def get_fundamental_search(request: FundamentalSearchRequest) -> APIRespon
     """基本面信息搜索"""
     if not _server_ready:
         return APIResponse(ret_code=-1, ret_msg="服务器正在初始化中，请稍后重试", data=None)
+    if not fundamental_service.is_configured():
+        return APIResponse(ret_code=-1, ret_msg="Metaso API 密钥未配置，无法使用基本面搜索功能", data=None)
     
     try:
         # 调用基本面搜索服务
@@ -1384,6 +2598,8 @@ async def get_stock_fundamental(request: dict) -> APIResponse:
     """股票基本面搜索 - 简化接口"""
     if not _server_ready:
         return APIResponse(ret_code=-1, ret_msg="服务器正在初始化中，请稍后重试", data=None)
+    if not fundamental_service.is_configured():
+        return APIResponse(ret_code=-1, ret_msg="Metaso API 密钥未配置，无法使用基本面搜索功能", data=None)
     
     try:
         stock_code = request.get("stock_code", "")
@@ -1400,6 +2616,23 @@ async def get_stock_fundamental(request: dict) -> APIResponse:
         return APIResponse(ret_code=-1, ret_msg=f"股票基本面搜索失败: {str(e)}", data=None)
 
 
+@app.post("/api/fundamental/news/refresh",
+          operation_id="refresh_fundamental_news",
+          summary="刷新基本面资讯",
+          description="根据指定数量重新抓取 Metaso 资讯并更新本地存储")
+async def refresh_fundamental_news(request: FundamentalNewsRefreshRequest) -> APIResponse:
+    if not _server_ready:
+        return APIResponse(ret_code=-1, ret_msg="服务器正在初始化中，请稍后重试", data=None)
+    if not fundamental_service.is_configured():
+        return APIResponse(ret_code=-1, ret_msg="Metaso API 密钥未配置，无法使用基本面搜索功能", data=None)
+    try:
+        signals = await _fetch_news_signals(request.code, request.size)
+        return APIResponse(ret_code=0, ret_msg="刷新成功", data={"signals": signals})
+    except Exception as e:
+        logger.error(f"刷新基本面资讯失败: {e}")
+        return APIResponse(ret_code=-1, ret_msg=f"刷新基本面资讯失败: {e}", data=None)
+
+
 @app.post("/api/fundamental/read_webpage",
           operation_id="read_webpage",
           summary="📄 读取网页内容",
@@ -1408,6 +2641,8 @@ async def read_webpage_endpoint(request: dict) -> APIResponse:
     """读取网页内容"""
     if not _server_ready:
         return APIResponse(ret_code=-1, ret_msg="服务器正在初始化中，请稍后重试", data=None)
+    if not fundamental_service.is_configured():
+        return APIResponse(ret_code=-1, ret_msg="Metaso API 密钥未配置，无法使用网页读取功能", data=None)
     
     try:
         url = request.get("url", "")
@@ -1449,6 +2684,8 @@ async def chat_endpoint(request: dict) -> APIResponse:
     """智能问答"""
     if not _server_ready:
         return APIResponse(ret_code=-1, ret_msg="服务器正在初始化中，请稍后重试", data=None)
+    if not fundamental_service.is_configured():
+        return APIResponse(ret_code=-1, ret_msg="Metaso API 密钥未配置，无法使用智能问答功能", data=None)
     
     try:
         messages = request.get("messages", [])
@@ -1583,6 +2820,7 @@ async def get_realtime_data_enhanced(request: RealtimeDataEnhancedRequest) -> AP
 
 if __name__ == "__main__":
     logger.info("🚀 启动富途MCP增强服务...")
+    logger.info("📊 Web 总览: http://localhost:8001/web  (若自定义了 DASHBOARD_BASE_URL，请替换成对应域名)")
     
     uvicorn.run(
         "main_enhanced:app",
@@ -1591,3 +2829,112 @@ if __name__ == "__main__":
         reload=False,  # 关闭reload避免初始化问题
         log_level="info"
     )
+def _merge_kline_records(left: Optional[List[Dict[str, Any]]], right: Optional[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+    if not left and not right:
+        return []
+    if not left:
+        return list(right or [])
+    if not right:
+        return list(left or [])
+    merged: Dict[str, Dict[str, Any]] = {}
+    for record in left:
+        key = record.get("time_key") or record.get("time")
+        if not key:
+            continue
+        merged[key] = dict(record)
+    for record in right:
+        key = record.get("time_key") or record.get("time")
+        if not key:
+            continue
+        base = merged.get(key, {})
+        base.update(record)
+        merged[key] = base
+    sorted_items = sorted(merged.items(), key=lambda item: item[0])
+    return [item[1] for item in sorted_items]
+
+
+def _build_analysis_context_text(snapshot: Dict[str, Any]) -> str:
+    quote = snapshot.get("quote") or {}
+    session = snapshot.get("session_window") or {}
+    capital_flow = (snapshot.get("capital_flow") or {}).get("summary", {})
+    capital_distribution = (snapshot.get("capital_distribution") or {}).get("summary", {})
+    insights = snapshot.get("insights") or {}
+    generated_at = snapshot.get("generated_at")
+    missing_parts: List[str] = []
+    lines = []
+    if quote:
+        lines.append(
+            f"[行情 @ {quote.get('update_time') or generated_at}] 价格 {quote.get('price') or quote.get('cur_price')}，"
+            f"涨跌幅 {quote.get('change_rate')}%，成交额 {quote.get('turnover')}，成交量 {quote.get('volume')}。"
+        )
+    holding = snapshot.get("holding") or {}
+    if holding:
+        parts = [f"{k}:{v}" for k, v in holding.items()]
+        lines.append("持仓: " + " / ".join(parts))
+    else:
+        missing_parts.append("持仓明细")
+
+    if session:
+        break_info = ""
+        if session.get("break_start") and session.get("break_end"):
+            break_info = f"，午休 {session['break_start']}~{session['break_end']}"
+        lines.append(
+            f"交易时段: {session.get('market','未知市场')} {session.get('open_time')}~{session.get('close_time')}{break_info}"
+        )
+    else:
+        missing_parts.append("交易时段")
+
+    signals = snapshot.get("signals") or {}
+    for sentiment in ("bullish", "bearish"):
+        items = signals.get(sentiment) or []
+        if items:
+            highlights = "; ".join(
+                f"{(item.get('title') or item.get('summary') or '').strip()} [{item.get('publish_time') or item.get('published_at')}]"
+                for item in items[:3]
+                if item
+            )
+            label = "利好" if sentiment == "bullish" else "利空"
+            lines.append(f"{label}资讯: {highlights}")
+    if not any(signals.get(key) for key in ("bullish", "bearish", "neutral")):
+        missing_parts.append("最新资讯/新闻")
+
+    tech_summary = insights.get("technical_summary")
+    if tech_summary:
+        lines.append(f"技术摘要: {tech_summary}")
+    if capital_flow:
+        lines.append(
+            f"资金流: {capital_flow.get('overall_trend')}，主力 {capital_flow.get('main_trend')}，"
+            f"最新净流入 {capital_flow.get('latest_net_inflow')}"
+        )
+    else:
+        missing_parts.append("资金流摘要")
+    if capital_distribution:
+        lines.append(
+            f"资金分布: 主导资金 {capital_distribution.get('dominant_fund_type')} "
+            f"{capital_distribution.get('dominant_fund_amount')}，总体 {capital_distribution.get('overall_trend')}"
+        )
+    recommendations = snapshot.get("recommendations") or []
+    if recommendations:
+        latest = recommendations[0]
+        lines.append(
+            f"最新策略: {latest.get('action')} ({latest.get('timeframe')}) "
+            f"信心 {latest.get('confidence')} 于 {latest.get('created_at')}"
+        )
+    quote_counts = [insights.get("signal_bullish"), insights.get("signal_bearish"), insights.get("signal_neutral")]
+    if any(v is not None for v in quote_counts):
+        lines.append(
+            f"信号分布: 利好 {insights.get('signal_bullish', '-')}"
+            f" / 利空 {insights.get('signal_bearish', '-')}"
+            f" / 中性 {insights.get('signal_neutral', '-')}"
+        )
+    if not quote:
+        missing_parts.append("实时行情")
+    if missing_parts:
+        lines.append("⚠️ 数据缺口: " + "、".join(missing_parts))
+    return "\n".join(lines)
+
+class MultiModelAnalysisRequest(BaseModel):
+    code: str = Field(..., description="股票代码, 如 HK.00700")
+    models: List[str] = Field(default_factory=lambda: ["deepseek", "kimi"], description="参与分析的模型列表")
+    judge_model: str = Field("gemini", description="最终评审模型")
+    question: Optional[str] = Field(None, description="额外关注的问题")

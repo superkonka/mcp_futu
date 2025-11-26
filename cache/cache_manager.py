@@ -121,6 +121,36 @@ class DataCacheManager:
         key_str = "|".join(key_parts)
         return hashlib.md5(key_str.encode()).hexdigest()
     
+    def _normalize_indicator_params(self, params: Dict) -> Dict:
+        """提取并标准化影响技术指标结果的参数"""
+        relevant_keys = [
+            "indicators", "ktype", "period",
+            "macd_fast", "macd_slow", "macd_signal",
+            "rsi_period", "rsi_overbought", "rsi_oversold",
+            "bollinger_period", "bollinger_std",
+            "ma_periods", "kdj_k_period", "kdj_d_period", "kdj_j_period",
+            "atr_period"
+        ]
+        
+        def _enum_to_value(value):
+            return value.value if hasattr(value, "value") else value
+        
+        normalized = {}
+        for key in relevant_keys:
+            if key not in params:
+                continue
+            value = params[key]
+            if value is None:
+                continue
+            if key in ("indicators", "ma_periods") and isinstance(value, list):
+                normalized[key] = tuple(
+                    sorted(_enum_to_value(v) for v in value)
+                )
+            else:
+                normalized[key] = _enum_to_value(value)
+        
+        return normalized
+    
     async def get_kline_data(self, code: str, ktype: str, start: str, end: str) -> Optional[List[Dict]]:
         """智能获取K线数据"""
         cache_key = self._generate_cache_key("kline", code=code, ktype=ktype, start=start, end=end)
@@ -192,10 +222,8 @@ class DataCacheManager:
     
     async def get_indicator_data(self, indicator_type: str, code: str, params: Dict) -> Optional[Dict]:
         """获取技术指标数据"""
-        # 避免参数冲突：先从params中移除可能冲突的参数
-        safe_params = params.copy()
-        safe_params.pop('code', None)  # 移除可能存在的code参数
-        cache_key = self._generate_cache_key("indicator", type=indicator_type, code=code, **safe_params)
+        normalized_params = self._normalize_indicator_params(params)
+        cache_key = self._generate_cache_key("indicator", type=indicator_type, code=code, **normalized_params)
         
         # 检查内存缓存
         memory_data = self._get_from_memory(cache_key)
@@ -213,10 +241,8 @@ class DataCacheManager:
     
     async def store_indicator_data(self, indicator_type: str, code: str, params: Dict, data: Dict):
         """存储技术指标数据"""
-        # 避免参数冲突：先从params中移除可能冲突的参数
-        safe_params = params.copy()
-        safe_params.pop('code', None)  # 移除可能存在的code参数
-        cache_key = self._generate_cache_key("indicator", type=indicator_type, code=code, **safe_params)
+        normalized_params = self._normalize_indicator_params(params)
+        cache_key = self._generate_cache_key("indicator", type=indicator_type, code=code, **normalized_params)
         
         self._store_to_memory(cache_key, data)
         await self._store_to_redis(cache_key, data, expire_seconds=300)  # 5分钟过期

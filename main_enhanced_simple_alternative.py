@@ -318,6 +318,15 @@ async def analysis_save(record: Dict[str, Any]) -> Dict[str, Any]:
     return {"ret_code": 0, "ret_msg": "ok", "data": {"id": rec_id}}
 
 
+def _normalize_kline_cache_scope(request: HistoryKLineRequest) -> Tuple[str, str, str]:
+    """生成用于缓存的K线范围标识，保证不同请求互不干扰"""
+    ktype_value = request.ktype.value if hasattr(request.ktype, "value") else str(request.ktype)
+    autype_value = request.autype.value if hasattr(request.autype, "value") else str(request.autype)
+    start_token = request.start or f"recent:{request.max_count}"
+    end_token = request.end or "latest"
+    return f"{ktype_value}:{autype_value}", start_token, end_token
+
+
 # ==================== 信息拉取与来源状态（最小占位） ====================
 @app.post("/api/info/fetch")
 async def info_fetch(body: Dict[str, Any]) -> Dict[str, Any]:
@@ -594,10 +603,11 @@ async def get_history_kline_enhanced(request: HistoryKLineRequest) -> APIRespons
     cache_hit = False
     
     try:
+        ktype_token, cache_start, cache_end = _normalize_kline_cache_scope(request)
         # 1. 尝试从缓存获取数据
         if CACHE_AVAILABLE and cache_manager:
             cached_data = await cache_manager.get_kline_data(
-                request.code, request.ktype.value, request.start, request.end
+                request.code, ktype_token, cache_start, cache_end
             )
             if cached_data:
                 cache_hit = True
@@ -621,8 +631,8 @@ async def get_history_kline_enhanced(request: HistoryKLineRequest) -> APIRespons
         # 3. 存储到缓存
         if result.ret_code == 0 and CACHE_AVAILABLE and cache_manager and result.data.get("kline_data"):
             await cache_manager.store_kline_data(
-                request.code, request.ktype.value, 
-                request.start, request.end,
+                request.code, ktype_token,
+                cache_start, cache_end,
                 result.data["kline_data"]
             )
         
