@@ -1,6 +1,5 @@
 """
-火山引擎Kimi模型API服务
-封装火山引擎ark API调用来实现智能对话功能
+Kimi 模型 API 服务（月之暗面官方接口）
 """
 
 import asyncio
@@ -21,25 +20,19 @@ from config import settings
 
 
 class KimiService:
-    """Kimi 模型服务，兼容火山引擎 Ark 与月之暗面官方 API"""
+    """Kimi 模型服务，仅使用月之暗面官方 API"""
 
     def __init__(self):
-        self.ark_api_key = settings.kimi_api_key
-        self.moonshot_api_key = settings.kimi_moonshot_key
-        if self.ark_api_key:
-            self.provider = "ark"
-            self.base_url = "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
-        elif self.moonshot_api_key:
-            self.provider = "moonshot"
-            self.base_url = "https://api.moonshot.cn/v1/chat/completions"
-        else:
-            self.provider = None
-            self.base_url = None
-        self.timeout = 30
+        self.api_key = settings.kimi_moonshot_key
+        self.base_url = "https://api.moonshot.cn/v1/chat/completions" if self.api_key else None
+        self.timeout = 60
+
+    def is_configured(self) -> bool:
+        return bool(self.api_key)
 
     def _require_api_key(self):
-        if not self.provider:
-            raise Exception("Kimi API 密钥未配置。请在 .env 中设置 KIMI_API_KEY 或 KIMI_MOONSHOT_KEY。")
+        if not self.api_key:
+            raise Exception("Kimi API 密钥未配置。请在 .env 中设置 KIMI_MOONSHOT_KEY。")
 
     async def chat_completion(self, request: KimiChatRequest) -> KimiChatResponse:
         """
@@ -60,12 +53,7 @@ class KimiService:
             logger.info(f"开始Kimi对话请求，消息数量: {len(request.messages)}")
             self._require_api_key()
 
-            if self.provider == "ark":
-                return await self._chat_ark(request)
-            elif self.provider == "moonshot":
-                return await self._chat_moonshot(request)
-            else:
-                raise Exception("Kimi Provider 未配置")
+            return await self._chat_moonshot(request)
 
         except asyncio.TimeoutError:
             logger.error("Kimi API请求超时")
@@ -84,51 +72,10 @@ class KimiService:
             execution_time = (datetime.now() - start_time).total_seconds()
             logger.info(f"Kimi对话请求完成，耗时: {execution_time:.3f}s")
 
-    async def _chat_ark(self, request: KimiChatRequest) -> KimiChatResponse:
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.ark_api_key}",
-        }
-
-        payload = {
-            "model": request.model,
-            "messages": [{"role": msg.role, "content": msg.content} for msg in request.messages],
-            "stream": request.stream,
-        }
-
-        if request.temperature is not None:
-            payload["temperature"] = request.temperature
-        if request.max_tokens is not None:
-            payload["max_tokens"] = request.max_tokens
-
-        logger.debug(f"Kimi API请求: {json.dumps(payload, ensure_ascii=False)}")
-
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=self.timeout)) as session:
-            async with session.post(self.base_url, headers=headers, json=payload) as response:
-                response_text = await response.text()
-
-                logger.debug(f"Kimi API响应状态: {response.status}")
-                logger.debug(f"Kimi API响应内容: {response_text}")
-
-                if response.status == 200:
-                    response_data = json.loads(response_text)
-                    return self._parse_response(response_data, request)
-
-                error_msg = f"Kimi API返回错误状态码 {response.status}: {response_text}"
-                try:
-                    error_data = json.loads(response_text)
-                    if "error" in error_data:
-                        error_code = error_data["error"].get("code", "Unknown")
-                        error_message = error_data["error"].get("message", response_text)
-                        error_msg = f"Kimi API错误 [{error_code}]: {error_message}"
-                except Exception:
-                    pass
-                raise Exception(error_msg)
-
     async def _chat_moonshot(self, request: KimiChatRequest) -> KimiChatResponse:
         headers = {
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.moonshot_api_key}",
+            "Authorization": f"Bearer {self.api_key}",
         }
 
         payload = {
@@ -159,27 +106,6 @@ class KimiService:
                 except Exception:
                     pass
                 raise Exception(error_msg)
-
-    def _parse_response(self, response_data: Dict[str, Any], request: KimiChatRequest) -> KimiChatResponse:
-        return KimiChatResponse(
-            id=response_data.get("id", ""),
-            object=response_data.get("object", "chat.completion"),
-            created=response_data.get("created", int(datetime.now().timestamp())),
-            model=response_data.get("model", request.model),
-            choices=[
-                KimiChatChoice(
-                    index=choice.get("index", 0),
-                    message=KimiChatMessage(role=choice["message"]["role"], content=choice["message"]["content"]),
-                    finish_reason=choice.get("finish_reason"),
-                )
-                for choice in response_data.get("choices", [])
-            ],
-            usage=KimiChatUsage(
-                prompt_tokens=response_data.get("usage", {}).get("prompt_tokens", 0),
-                completion_tokens=response_data.get("usage", {}).get("completion_tokens", 0),
-                total_tokens=response_data.get("usage", {}).get("total_tokens", 0),
-            ),
-        )
 
     def _parse_moonshot_response(self, response_data: Dict[str, Any], request: KimiChatRequest) -> KimiChatResponse:
         return KimiChatResponse(

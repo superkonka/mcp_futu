@@ -1,8 +1,11 @@
 import asyncio
-from typing import Optional, Any, Dict, List
+from datetime import datetime, timedelta
+from typing import Optional, Any, Dict, List, Union
 
 from google import genai
+from google.genai import types
 from loguru import logger
+from google.genai import errors as genai_errors
 
 from config import settings
 
@@ -18,8 +21,11 @@ class GeminiService:
             "max_output_tokens": 1024,
             "response_mime_type": "text/plain",
         }
+        self.default_thinking_level = types.ThinkingLevel.LOW
         self.max_retries = 2
         self.retry_delay = 0.6
+        self.location_blocked_until: Optional[datetime] = None
+        self.last_error_message: Optional[str] = None
         if self.api_key:
             try:
                 self.client = genai.Client(api_key=self.api_key)
@@ -34,10 +40,17 @@ class GeminiService:
         self,
         prompt: str,
         temperature: float = 1.0,
-        thinking_level: Optional[str] = None,
+        thinking_level: Optional[Union[str, types.ThinkingLevel]] = None,
     ) -> Optional[str]:
         if not self.client:
             return None
+        if self.location_blocked_until:
+            now = datetime.utcnow()
+            if now < self.location_blocked_until:
+                wait_sec = int((self.location_blocked_until - now).total_seconds())
+                logger.warning(f"Gemini 因地区限制暂不可用，约 {wait_sec}s 后重试")
+                return None
+            self.location_blocked_until = None
         loop = asyncio.get_running_loop()
         attempt = 0
         last_error: Optional[Exception] = None
@@ -63,31 +76,73 @@ class GeminiService:
         self,
         prompt: str,
         temperature: float,
-        thinking_level: Optional[str],
+        thinking_level: Optional[Union[str, types.ThinkingLevel]],
     ) -> Optional[str]:
         try:
             effective_temp = max(0.0, min(temperature, 2.0))
-            config_payload: Dict[str, Any] = {
-                **self.base_generation_config,
-                "temperature": effective_temp,
-            }
-            if thinking_level:
-                config_payload["thinking_level"] = thinking_level
-            logger.debug(f"[Gemini] 请求参数: model={self.model}, config={config_payload}")
+            config = self._build_generation_config(effective_temp, thinking_level)
+            logger.debug(
+                f"[Gemini] 请求参数: model={self.model}, config={config.model_dump(exclude_none=True)}"
+            )
             response = self.client.models.generate_content(
                 model=self.model,
                 contents=[{"role": "user", "parts": [{"text": prompt}]}],
-                config=config_payload,
+                config=config,
             )
             self._log_response_meta(response)
+            self.location_blocked_until = None
             text = self._extract_text(response)
             if text:
                 return text.strip()
             logger.warning(f"[Gemini] 响应未包含文本，finish={self._summarize_candidates(response)}")
             return None
+        except genai_errors.ClientError as client_error:
+            message = getattr(client_error, "message", str(client_error))
+            self.last_error_message = message
+            if "User location is not supported" in message:
+                block_until = datetime.utcnow() + timedelta(minutes=5)
+                self.location_blocked_until = block_until
+                logger.error(
+                    "[Gemini] 地区限制导致无法调用，已暂时禁用 Gemini 至 %s。",
+                    block_until.isoformat(timespec="seconds"),
+                )
+            else:
+                logger.exception("[Gemini] 调用失败")
+            return None
         except Exception:
             logger.exception("[Gemini] 调用失败")
             return None
+
+    def _build_generation_config(
+        self,
+        temperature: float,
+        thinking_level: Optional[Union[str, types.ThinkingLevel]],
+    ) -> types.GenerateContentConfig:
+        effective_level = self._resolve_thinking_level(thinking_level)
+        thinking_config = types.ThinkingConfig(
+            include_thoughts=False,
+            thinking_level=effective_level,
+        )
+        payload: Dict[str, Any] = {
+            **self.base_generation_config,
+            "temperature": temperature,
+            "thinking_config": thinking_config,
+        }
+        return types.GenerateContentConfig(**payload)
+
+    def _resolve_thinking_level(
+        self,
+        override: Optional[Union[str, types.ThinkingLevel]],
+    ) -> types.ThinkingLevel:
+        if isinstance(override, types.ThinkingLevel):
+            return override
+        if override:
+            normalized = override.strip().lower()
+            if normalized in ("low", "thinking_level_low"):
+                return types.ThinkingLevel.LOW
+            if normalized in ("high", "thinking_level_high"):
+                return types.ThinkingLevel.HIGH
+        return self.default_thinking_level
 
     def _extract_text(self, response: Any) -> Optional[str]:
         if getattr(response, "text", None):

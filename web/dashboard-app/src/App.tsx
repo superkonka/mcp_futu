@@ -2,6 +2,25 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import type { CandlestickData, HistogramData, UTCTimestamp } from 'lightweight-charts'
 import KLineChart from './components/KLineChart'
 
+const DASHBOARD_MODULES = ['core', 'signals', 'recommendations', 'capital', 'kline'] as const
+type DashboardModule = (typeof DASHBOARD_MODULES)[number]
+
+type ModuleStatus = {
+  loading: boolean
+  error: string | null
+}
+
+type ModuleStatusMap = Record<DashboardModule, ModuleStatus>
+
+const createModuleStatusMap = (): ModuleStatusMap =>
+  DASHBOARD_MODULES.reduce(
+    (acc, module) => {
+      acc[module] = { loading: false, error: null }
+      return acc
+    },
+    {} as ModuleStatusMap
+  )
+
 interface QuoteDetail {
   code?: string
   name?: string
@@ -644,6 +663,14 @@ const getChangeColor = (value?: number | string | null) => {
   return numeric >= 0 ? 'text-emerald-500' : 'text-rose-500'
 }
 
+const formatPriceDelta = (delta: number) => {
+  if (!Number.isFinite(delta) || delta === 0) {
+    return null
+  }
+  const prefix = delta > 0 ? '+' : ''
+  return `${prefix}${delta.toFixed(2)}`
+}
+
 export default function App() {
   const [sessions, setSessions] = useState<SessionItem[]>([])
   const [quota, setQuota] = useState<QuotaInfo | null>(null)
@@ -657,13 +684,16 @@ export default function App() {
   const [detailLoading, setDetailLoading] = useState(false)
   const [detailError, setDetailError] = useState<string | null>(null)
   const [data, setData] = useState<DashboardData | null>(null)
+  const [moduleStatus, setModuleStatus] = useState<ModuleStatusMap>(() => createModuleStatusMap())
   const [streamQuote, setStreamQuote] = useState<QuoteDetail | null>(null)
   const [streamKlines, setStreamKlines] = useState<KLinePoint[]>([])
   const [streamStatus, setStreamStatus] = useState<StreamStatus>('idle')
   const [streamError, setStreamError] = useState<string | null>(null)
   const [deletingId, setDeletingId] = useState<string | null>(null)
+  const [serverHeartbeat, setServerHeartbeat] = useState<string | null>(null)
   const streamRef = useRef<EventSource | null>(null)
   const reconnectTimer = useRef<number | null>(null)
+  const detailLoadRef = useRef(0)
 
   const usagePercent = useMemo(() => {
     if (!quota) return 0
@@ -728,12 +758,46 @@ export default function App() {
     const handleMessage = (event: MessageEvent<string>) => {
       try {
         const payload = JSON.parse(event.data) as StreamPayload
-        if (payload.quote) {
-          setStreamQuote((prev) => ({ ...prev, ...payload.quote }))
+        if (payload.timestamp) {
+          setServerHeartbeat(typeof payload.timestamp === 'string' ? payload.timestamp : new Date(payload.timestamp).toISOString())
+        }
+        const quotePayload = payload.quote as QuoteDetail | undefined
+        if (quotePayload) {
+          setStreamQuote((prev) => (prev ? { ...prev, ...quotePayload } : quotePayload))
+          setData((prev) => {
+            if (!prev || payload.code !== prev.code) {
+              return prev
+            }
+            return {
+              ...prev,
+              quote: { ...(prev.quote || {}), ...quotePayload }
+            }
+          })
+          setSessions((prev) =>
+            prev.map((item) => {
+              if (item.session_id !== selectedSession) {
+                return item
+              }
+              return {
+                ...item,
+                quote: { ...(item.quote || {}), ...quotePayload }
+              }
+            })
+          )
         }
         const klineRecords = normalizeKLineRecords(payload.kline)
         if (klineRecords.length) {
           setStreamKlines((prev) => mergeKlineSeries(prev, klineRecords))
+          setData((prev) => {
+            if (!prev || payload.code !== prev.code) {
+              return prev
+            }
+            const existing = Array.isArray(prev.history_kline) ? prev.history_kline : []
+            return {
+              ...prev,
+              history_kline: mergeKlineSeries(existing, klineRecords)
+            }
+          })
         }
       } catch (err) {
         console.warn('解析SSE数据失败', err)
@@ -804,22 +868,104 @@ export default function App() {
     }
   }
 
+  function applyModulePayload(module: DashboardModule, payload: Partial<DashboardData>) {
+    setData((prev) => {
+      if (!prev) {
+        if (module === 'core') {
+          return payload as DashboardData
+        }
+        return prev
+      }
+      return { ...prev, ...payload } as DashboardData
+    })
+  }
+
+  async function fetchDashboardModules(sessionId: string, modules: DashboardModule[]): Promise<Partial<DashboardData>> {
+    const params = new URLSearchParams({ session: sessionId })
+    if (modules.length) {
+      params.set('modules', modules.join(','))
+    }
+    const res = await fetch(`/api/dashboard/bootstrap?${params.toString()}`)
+    if (!res.ok) {
+      const text = await res.text()
+      throw new Error(text || '模块加载失败')
+    }
+    return (await res.json()) as Partial<DashboardData>
+  }
+
+  async function runModuleFetch(sessionId: string, module: DashboardModule, loadId: number) {
+    try {
+      const payload = await fetchDashboardModules(sessionId, [module])
+      if (detailLoadRef.current !== loadId) {
+        return
+      }
+      applyModulePayload(module, payload)
+      setModuleStatus((prev) => ({
+        ...prev,
+        [module]: { loading: false, error: null }
+      }))
+    } catch (err) {
+      if (detailLoadRef.current !== loadId) {
+        return
+      }
+      const message = (err as Error).message || '模块加载失败'
+      setModuleStatus((prev) => ({
+        ...prev,
+        [module]: { loading: false, error: message }
+      }))
+      if (module === 'core') {
+        throw err
+      }
+    }
+  }
+
   async function loadDetail(sessionId: string, opts?: { preserve?: boolean }) {
-    setDetailLoading(true)
+    const loadId = ++detailLoadRef.current
+    const shouldBlock = !opts?.preserve || !data
+    if (shouldBlock) {
+      setDetailLoading(true)
+    }
     setDetailError(null)
     if (!opts?.preserve) {
       setData(null)
     }
+    setModuleStatus(() => {
+      const base = createModuleStatusMap()
+      DASHBOARD_MODULES.forEach((module) => {
+        base[module] = { loading: true, error: null }
+      })
+      return base
+    })
     try {
-      const res = await fetch(`/api/dashboard/bootstrap?session=${sessionId}`)
-      if (!res.ok) throw new Error('无法加载面板数据')
-      const json = await res.json()
-      setData(json)
-    } catch (err) {
-      setDetailError((err as Error).message)
-    } finally {
+      await runModuleFetch(sessionId, 'core', loadId)
+      if (detailLoadRef.current !== loadId) {
+        return
+      }
       setDetailLoading(false)
+    } catch (err) {
+      if (detailLoadRef.current !== loadId) {
+        return
+      }
+      setDetailError((err as Error).message || '无法加载面板数据')
+      setDetailLoading(false)
+      return
     }
+    DASHBOARD_MODULES.filter((module) => module !== 'core').forEach((module) => {
+      runModuleFetch(sessionId, module, loadId)
+    })
+  }
+
+  const handleReloadModule = (module: DashboardModule) => {
+    if (!selectedSession) return
+    setModuleStatus((prev) => ({
+      ...prev,
+      [module]: { loading: true, error: null }
+    }))
+    runModuleFetch(selectedSession, module, detailLoadRef.current).catch((err) => {
+      if (module === 'core') {
+        setDetailError((err as Error).message || '无法加载面板数据')
+      }
+    })
   }
 
   async function handleCreate(e: React.FormEvent<HTMLFormElement>) {
@@ -895,6 +1041,8 @@ export default function App() {
   const detailSection = data ? (
     <DetailContent
       data={data}
+      moduleStatus={moduleStatus}
+      serverHeartbeat={serverHeartbeat}
       liveQuote={streamQuote}
       candles={candleData}
       volumes={volumeData}
@@ -903,6 +1051,7 @@ export default function App() {
       streamError={streamError}
       onBack={() => setSelectedSession(null)}
       onRefresh={() => selectedSession && loadDetail(selectedSession, { preserve: true })}
+      onReloadModule={handleReloadModule}
       onUpdateSignals={(signals) =>
         setData((prev) =>
           prev
@@ -1100,6 +1249,8 @@ export default function App() {
 
 type DetailContentProps = {
   data: DashboardData
+  moduleStatus: ModuleStatusMap
+  serverHeartbeat: string | null
   liveQuote?: QuoteDetail | null
   candles: CandlestickData[]
   volumes: HistogramData[]
@@ -1109,12 +1260,32 @@ type DetailContentProps = {
   onBack: () => void
   onRefresh: () => void
   onUpdateSignals?: (signals: SignalMap) => void
+  onReloadModule?: (module: DashboardModule) => void
 }
 
-function DetailContent({ data, liveQuote, candles, volumes, klineCount, streamStatus, streamError, onBack, onRefresh, onUpdateSignals }: DetailContentProps) {
+function DetailContent({
+  data,
+  moduleStatus,
+  serverHeartbeat,
+  liveQuote,
+  candles,
+  volumes,
+  klineCount,
+  streamStatus,
+  streamError,
+  onBack,
+  onRefresh,
+  onUpdateSignals,
+  onReloadModule
+}: DetailContentProps) {
   const quote = liveQuote ?? data.quote
   const sessionMeta = data.session
   const sessionWindow = data.session_window
+  const signalModuleState = moduleStatus.signals
+  const recommendationModuleState = moduleStatus.recommendations
+  const capitalModuleState = moduleStatus.capital
+  const klineModuleState = moduleStatus.kline
+  const [heartbeatNow, setHeartbeatNow] = useState(() => Date.now())
   const [analysisModels, setAnalysisModels] = useState<string[]>(['deepseek', 'kimi'])
   const [analysisJudge, setAnalysisJudge] = useState<string>('gemini')
   const [analysisQuestion, setAnalysisQuestion] = useState('')
@@ -1137,12 +1308,18 @@ function DetailContent({ data, liveQuote, candles, volumes, klineCount, streamSt
   const [analysisWindow, setAnalysisWindow] = useState<{ start?: string; end?: string } | null>(null)
   const [analysisContextSnapshot, setAnalysisContextSnapshot] = useState<Record<string, any> | null>(null)
   const [newsSize, setNewsSize] = useState(10)
+  const [newsDays, setNewsDays] = useState(3)
   const [newsRefreshing, setNewsRefreshing] = useState(false)
   const [strategyPageId, setStrategyPageId] = useState<string | null>(() => {
     const params = new URLSearchParams(window.location.search)
     return params.get('strategy')
   })
   const [prefetchedStrategy, setPrefetchedStrategy] = useState<RecommendationItem | null>(null)
+  const [lastPrice, setLastPrice] = useState<number | null>(null)
+  const [priceTrend, setPriceTrend] = useState<'up' | 'down' | 'flat'>('flat')
+  const [priceDelta, setPriceDelta] = useState<number | null>(null)
+  const [pricePulseToken, setPricePulseToken] = useState(0)
+  const [pricePulse, setPricePulse] = useState(false)
   useEffect(() => {
     setAnalysisResult(null)
     setAnalysisQuestion('')
@@ -1166,6 +1343,45 @@ function DetailContent({ data, liveQuote, candles, volumes, klineCount, streamSt
     window.addEventListener('popstate', handler)
     return () => window.removeEventListener('popstate', handler)
   }, [])
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    const timer = window.setInterval(() => setHeartbeatNow(Date.now()), 1000)
+    return () => window.clearInterval(timer)
+  }, [])
+
+  useEffect(() => {
+    const rawPrice = quote?.price
+    const numericPrice =
+      typeof rawPrice === 'number'
+        ? rawPrice
+        : rawPrice !== undefined && rawPrice !== null
+        ? Number(rawPrice)
+        : null
+    if (numericPrice === null || Number.isNaN(numericPrice)) {
+      return
+    }
+    setLastPrice((prev) => {
+      if (prev === null) {
+        return numericPrice
+      }
+      if (numericPrice !== prev) {
+        setPriceTrend(numericPrice > prev ? 'up' : 'down')
+        setPriceDelta(numericPrice - prev)
+        setPricePulseToken((token) => token + 1)
+      } else {
+        setPriceTrend('flat')
+        setPriceDelta(null)
+      }
+      return numericPrice
+    })
+  }, [quote?.price])
+
+  useEffect(() => {
+    if (!pricePulseToken || typeof window === 'undefined') return
+    setPricePulse(true)
+    const timer = window.setTimeout(() => setPricePulse(false), 700)
+    return () => window.clearTimeout(timer)
+  }, [pricePulseToken])
 
   if (strategyPageId) {
     return (
@@ -1188,6 +1404,14 @@ function DetailContent({ data, liveQuote, candles, volumes, klineCount, streamSt
     connected: { text: '实时更新中', dot: 'bg-emerald-400' },
     disconnected: { text: '已断开，尝试重连', dot: 'bg-rose-400 animate-pulse' }
   }[streamStatus] ?? { text: '实时状态未知', dot: 'bg-slate-300' }
+  const heartbeatLagMs = useMemo(() => {
+    if (!serverHeartbeat) return null
+    const parsed = Date.parse(serverHeartbeat)
+    if (Number.isNaN(parsed)) return null
+    return Math.max(0, heartbeatNow - parsed)
+  }, [serverHeartbeat, heartbeatNow])
+  const heartbeatHealthy = heartbeatLagMs !== null && heartbeatLagMs < 15000
+  const heartbeatText = heartbeatLagMs !== null ? `${Math.floor(heartbeatLagMs / 1000)}s` : '--'
 
   const realtimePoints = data.history?.length ?? 0
   const metrics = [
@@ -1347,6 +1571,7 @@ const timelineGroups = useMemo<TimelineGroup[]>(() => {
     }
   ]
   const newsSizeOptions = useMemo(() => Array.from({ length: 10 }, (_, idx) => (idx + 1) * 10), [])
+  const newsDaysOptions = useMemo(() => [3, 7, 14, 30], [])
   const sentimentStyles = {
     bullish: {
       dot: 'bg-emerald-500',
@@ -1533,13 +1758,16 @@ const timelineGroups = useMemo<TimelineGroup[]>(() => {
     }
   }
 
-  const handleRefreshNews = async () => {
-    setNewsRefreshing(true)
+  const handleRefreshNews = async (opts?: { silent?: boolean }) => {
+    const silent = opts?.silent ?? false
+    if (!silent) {
+      setNewsRefreshing(true)
+    }
     try {
       const res = await fetch('/api/fundamental/news/refresh', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ code: data.code, size: newsSize })
+        body: JSON.stringify({ code: data.code, size: newsSize, days: newsDays })
       })
       if (!res.ok) {
         const text = await res.text()
@@ -1551,11 +1779,18 @@ const timelineGroups = useMemo<TimelineGroup[]>(() => {
       }
       onUpdateSignals?.(json.data.signals)
     } catch (err) {
-      alert((err as Error).message)
+      if (silent) {
+        console.warn('[fundamental.refresh] failed', err)
+      } else {
+        alert((err as Error).message)
+      }
     } finally {
-      setNewsRefreshing(false)
+      if (!silent) {
+        setNewsRefreshing(false)
+      }
     }
   }
+
 
   const handleSaveJudgeRecommendation = async () => {
     const recommended = analysisResult?.judge?.result?.recommended as MultiModelAction | undefined
@@ -1667,6 +1902,27 @@ const timelineGroups = useMemo<TimelineGroup[]>(() => {
     return { left: Math.max(0, left), width: Math.max(0, width) }
   }, [sessionWindow])
 
+  const priceDeltaText = priceDelta !== null ? formatPriceDelta(priceDelta) : null
+  const priceBoxClass = `
+    relative px-4 py-3 rounded-2xl transition-all duration-500 text-right
+    ${
+      priceTrend === 'up'
+        ? 'bg-emerald-50 text-emerald-600'
+        : priceTrend === 'down'
+        ? 'bg-rose-50 text-rose-600'
+        : 'bg-slate-50 text-slate-600'
+    }
+    ${
+      pricePulse
+        ? priceTrend === 'up'
+          ? 'ring-2 ring-emerald-200'
+          : priceTrend === 'down'
+          ? 'ring-2 ring-rose-200'
+          : 'ring-2 ring-slate-200'
+        : 'ring-0'
+    }
+  `.replace(/\s+/g, ' ')
+
   return (
     <div className="px-6 py-6 space-y-6">
       <div className="flex flex-wrap items-start gap-4">
@@ -1684,13 +1940,34 @@ const timelineGroups = useMemo<TimelineGroup[]>(() => {
           {streamError && (
             <div className="text-[11px] text-amber-600 mt-1">{streamError}</div>
           )}
+          {serverHeartbeat && (
+            <div className="mt-2 flex flex-wrap items-center gap-2 text-[11px] text-slate-400">
+              <span className={`h-2 w-2 rounded-full ${heartbeatHealthy ? 'bg-emerald-400' : 'bg-rose-500 animate-pulse'}`}></span>
+              <span>后台时间 {formatDateTime(serverHeartbeat)}</span>
+              <span>延迟 {heartbeatText}</span>
+            </div>
+          )}
         </div>
-        <div className="text-right">
-          <div className={`text-4xl font-bold ${accent === 'rose' ? 'text-rose-500' : accent === 'emerald' ? 'text-emerald-500' : 'text-slate-700'}`}>
-            {formatPrice(quote?.price)}
-          </div>
-          <div className={`text-sm mt-1 font-medium ${accent === 'rose' ? 'text-rose-500' : accent === 'emerald' ? 'text-emerald-500' : 'text-slate-500'}`}>
-            {formatChangeText(quote?.change_rate, quote?.change_value)}
+        <div className="flex flex-col items-end gap-2">
+          <div className={priceBoxClass}>
+            <div className="text-4xl font-bold leading-none">{formatPrice(quote?.price)}</div>
+            <div className="flex items-center justify-end gap-2 text-xs mt-2 text-current">
+              <span className="font-semibold">{formatChangeText(quote?.change_rate, quote?.change_value)}</span>
+              {priceDeltaText && (
+                <span
+                  className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[11px] font-medium ${
+                    priceTrend === 'up'
+                      ? 'bg-white/80 text-emerald-600'
+                      : priceTrend === 'down'
+                      ? 'bg-white/80 text-rose-600'
+                      : 'bg-white/80 text-slate-600'
+                  }`}
+                >
+                  {priceTrend === 'up' ? '▲' : priceTrend === 'down' ? '▼' : ''}
+                  {priceDeltaText}
+                </span>
+              )}
+            </div>
           </div>
           <div className="mt-3 flex gap-2 justify-end">
             <button onClick={onRefresh} className="px-3 py-1.5 rounded-full border border-slate-200 text-slate-600 hover:bg-slate-50 text-xs">
@@ -1705,6 +1982,16 @@ const timelineGroups = useMemo<TimelineGroup[]>(() => {
 
       <div className="rounded-3xl border border-slate-100 bg-gradient-to-b from-slate-50 to-white p-4 relative overflow-hidden">
         <KLineChart candles={candles} volumes={volumes} accent={accent} sessionWindow={sessionWindow} />
+        {klineModuleState.loading && !candles.length && (
+          <ModuleOverlayStatus message="正在加载分钟级 K 线..." />
+        )}
+        {klineModuleState.error && !candles.length && (
+          <ModuleOverlayStatus
+            variant="error"
+            message={klineModuleState.error || 'K 线加载失败'}
+            onRetry={() => onReloadModule?.('kline')}
+          />
+        )}
         {breakOverlay && (
           <div
             className="absolute inset-y-4 rounded-xl bg-slate-100/50 pointer-events-none"
@@ -1766,6 +2053,22 @@ const timelineGroups = useMemo<TimelineGroup[]>(() => {
               })}
               <span className="text-xs text-slate-400">共 {displayedTimelineCount} 条</span>
               <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500 ml-auto">
+                <label htmlFor="news-days" className="text-slate-500">
+                  刷新时间范围（仅用于拉新）：
+                </label>
+                <select
+                  id="news-days"
+                  className="rounded-full border border-slate-200 px-2 py-1 text-slate-700"
+                  value={newsDays}
+                  onChange={(e) => setNewsDays(Number(e.target.value))}
+                >
+                  {newsDaysOptions.map((d) => (
+                    <option key={d} value={d}>
+                      最近 {d} 天
+                    </option>
+                  ))}
+                </select>
+                <span className="text-[11px] text-slate-400">默认展示本地缓存，可重载缓存或点击刷新获取最新</span>
                 <label htmlFor="news-size" className="text-slate-500">
                   每次拉取：
                 </label>
@@ -1783,22 +2086,46 @@ const timelineGroups = useMemo<TimelineGroup[]>(() => {
                 </select>
                 <button
                   type="button"
-                  onClick={handleRefreshNews}
+                  onClick={() => onReloadModule?.('signals')}
+                  disabled={signalModuleState.loading}
+                  className="px-3 py-1.5 rounded-full border border-slate-200 text-slate-600 hover:bg-slate-50 disabled:opacity-50"
+                  title="仅重载本地缓存，不访问外部搜索"
+                >
+                  重载缓存
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleRefreshNews()}
                   disabled={newsRefreshing}
                   className="px-3 py-1.5 rounded-full border border-blue-200 text-blue-600 hover:bg-blue-50 disabled:opacity-50"
                 >
                   {newsRefreshing ? '刷新中...' : '刷新基本面'}
                 </button>
+                {signalModuleState.loading && timelineNews.length > 0 && <span className="text-amber-600">更新中...</span>}
+                {signalModuleState.error && timelineNews.length > 0 && (
+                  <button type="button" onClick={() => onReloadModule?.('signals')} className="text-rose-500 hover:underline">
+                    重新加载
+                  </button>
+                )}
               </div>
             </div>
           </div>
 
           <div className="timeline-scroll mt-4 flex-1 pr-3 max-h-[520px] lg:max-h-[640px] overflow-y-auto">
-            {filteredTimelineGroups.length ? (
+            {signalModuleState.loading && !timelineNews.length ? (
+              <ModuleInlineStatus message="正在拉取基本面资讯..." />
+            ) : signalModuleState.error && !timelineNews.length ? (
+              <ModuleInlineStatus
+                variant="error"
+                message={signalModuleState.error || '获取资讯失败'}
+                onRetry={() => onReloadModule?.('signals')}
+              />
+            ) : filteredTimelineGroups.length ? (
               filteredTimelineGroups.map((group) => {
                 const metric = group.metric
                 const weighted = metric ? (metric.weighted_score ?? metric.score) : null
-                const sentimentSummaryColor = weighted !== null ? (weighted >= 0 ? 'text-emerald-600' : 'text-rose-500') : 'text-slate-500'
+                const sentimentSummaryColor =
+                  weighted !== null ? (weighted >= 0 ? 'text-emerald-600' : 'text-rose-500') : 'text-slate-500'
                 const weightedLabel = weighted !== null ? `${weighted >= 0 ? '+' : ''}${(weighted * 100).toFixed(0)}%` : '--'
                 return (
                   <div key={group.key} className="mb-10 last:mb-0">
@@ -1813,9 +2140,7 @@ const timelineGroups = useMemo<TimelineGroup[]>(() => {
                             <span>利好 {metric.bullish}</span>
                             <span>利空 {metric.bearish}</span>
                             <span>中性 {metric.neutral}</span>
-                            <span className={`font-semibold ${sentimentSummaryColor}`}>
-                              情绪 {weightedLabel}
-                            </span>
+                            <span className={`font-semibold ${sentimentSummaryColor}`}>情绪 {weightedLabel}</span>
                           </div>
                         )}
                       </div>
@@ -1858,9 +2183,7 @@ const timelineGroups = useMemo<TimelineGroup[]>(() => {
                                   <span>{formatDateTime(item.publish_time || item.published_at)}</span>
                                   {eventType && <span>{eventType}</span>}
                                   {effectiveness && (
-                                    <span>
-                                      {effectiveness === 'fresh' ? '新信息' : effectiveness === 'diminished' ? '影响减弱' : '已消化'}
-                                    </span>
+                                    <span>{effectiveness === 'fresh' ? '新信息' : effectiveness === 'diminished' ? '影响减弱' : '已消化'}</span>
                                   )}
                                   {confidence && <span>置信 {confidence}</span>}
                                   {horizon && <span>{horizon}</span>}
@@ -1911,6 +2234,13 @@ const timelineGroups = useMemo<TimelineGroup[]>(() => {
         </section>
 
         <aside className="space-y-4 self-stretch">
+          {capitalModuleState.error && !flowSummary && !distributionSummary && (
+            <ModuleInlineStatus
+              variant="error"
+              message={capitalModuleState.error || '资金模块加载失败'}
+              onRetry={() => onReloadModule?.('capital')}
+            />
+          )}
           <div className="rounded-2xl border border-slate-200 bg-white p-5 space-y-3">
             <div className="flex items-center justify-between">
               <h4 className="text-sm font-semibold text-slate-900">持仓速览</h4>
@@ -1935,7 +2265,9 @@ const timelineGroups = useMemo<TimelineGroup[]>(() => {
               <h4 className="text-sm font-semibold text-slate-900">资金流向</h4>
               <span className="text-xs text-slate-400">{flowSummary?.latest_time ? formatDateTime(flowSummary.latest_time) : '--'}</span>
             </div>
-            {flowSummary ? (
+            {capitalModuleState.loading && !flowSummary ? (
+              <ModuleInlineStatus message="正在获取资金流向..." compact />
+            ) : flowSummary ? (
               <dl className="grid grid-cols-2 gap-3 text-sm">
                 <div>
                   <dt className="text-slate-500 text-xs">总体</dt>
@@ -1964,7 +2296,9 @@ const timelineGroups = useMemo<TimelineGroup[]>(() => {
               <h4 className="text-sm font-semibold text-slate-900">资金分布</h4>
               <span className="text-xs text-slate-400">{distributionSummary?.update_time ? formatDateTime(distributionSummary.update_time) : '--'}</span>
             </div>
-            {distributionSummary ? (
+            {capitalModuleState.loading && !distributionSummary ? (
+              <ModuleInlineStatus message="正在汇总资金分布..." compact />
+            ) : distributionSummary ? (
               <div className="space-y-3 text-sm">
                 <div className="text-base font-semibold text-slate-900">{distributionSummary.overall_trend ?? '--'}</div>
                 <div className="text-xs text-slate-500">
@@ -2327,10 +2661,32 @@ const timelineGroups = useMemo<TimelineGroup[]>(() => {
             <h3 className="text-lg font-semibold text-slate-900">策略建议时间轴</h3>
             <p className="text-xs text-slate-400">来自 MCP 策略记录</p>
           </div>
-          <span className="text-xs text-slate-500">{recommendations.length} 条记录</span>
+          <div className="flex items-center gap-3 text-xs text-slate-500">
+            <span>{recommendations.length} 条记录</span>
+            {recommendationModuleState.loading && recommendations.length > 0 && <span className="text-amber-600">更新中...</span>}
+            {recommendationModuleState.error && recommendations.length > 0 && (
+              <button
+                type="button"
+                onClick={() => onReloadModule?.('recommendations')}
+                className="text-rose-500 hover:underline"
+              >
+                重新加载
+              </button>
+            )}
+          </div>
         </div>
         <div className="mt-6 space-y-4 pr-2">
-          <RecommendationTimeline items={recommendations} onSelect={handleOpenStrategyDetail} />
+          {recommendationModuleState.loading && !recommendations.length ? (
+            <ModuleInlineStatus message="正在同步策略建议..." />
+          ) : recommendationModuleState.error && !recommendations.length ? (
+            <ModuleInlineStatus
+              variant="error"
+              message={recommendationModuleState.error || '策略模块加载失败'}
+              onRetry={() => onReloadModule?.('recommendations')}
+            />
+          ) : (
+            <RecommendationTimeline items={recommendations} onSelect={handleOpenStrategyDetail} />
+          )}
         </div>
       </section>
 
@@ -2462,6 +2818,65 @@ function RecommendationTimeline({ items, onSelect }: RecommendationTimelineProps
         )
       })}
     </ol>
+  )
+}
+
+type ModuleInlineStatusProps = {
+  message: string
+  variant?: 'loading' | 'error'
+  onRetry?: () => void
+  compact?: boolean
+}
+
+function ModuleInlineStatus({ message, variant = 'loading', onRetry, compact }: ModuleInlineStatusProps) {
+  const isLoading = variant === 'loading'
+  const baseClass = isLoading
+    ? 'border-slate-200 bg-slate-50 text-slate-500'
+    : 'border-rose-200 bg-rose-50/80 text-rose-600'
+  return (
+    <div
+      className={`rounded-2xl border border-dashed ${baseClass} ${compact ? 'p-3 text-xs' : 'p-4 text-sm'} flex items-center justify-between gap-3`}
+    >
+      <span className="flex items-center gap-2">
+        <span className={`h-2 w-2 rounded-full ${isLoading ? 'bg-slate-300 animate-pulse' : 'bg-rose-400'}`}></span>
+        {message}
+      </span>
+      {onRetry && (
+        <button
+          type="button"
+          onClick={onRetry}
+          className="text-xs px-2 py-1 rounded-full border border-slate-200 text-slate-600 hover:bg-white"
+        >
+          重试
+        </button>
+      )}
+    </div>
+  )
+}
+
+type ModuleOverlayStatusProps = {
+  message: string
+  variant?: 'loading' | 'error'
+  onRetry?: () => void
+}
+
+function ModuleOverlayStatus({ message, variant = 'loading', onRetry }: ModuleOverlayStatusProps) {
+  const isLoading = variant === 'loading'
+  const textClass = isLoading ? 'text-slate-600' : 'text-rose-600'
+  const borderClass = isLoading ? 'border-transparent' : 'border border-rose-200'
+  return (
+    <div className={`absolute inset-0 z-10 flex flex-col items-center justify-center gap-3 bg-white/85 ${borderClass} ${textClass}`}>
+      <span className="text-sm">{message}</span>
+      {onRetry && (
+        <button
+          type="button"
+          onClick={onRetry}
+          className="px-3 py-1.5 rounded-full border border-slate-300 text-xs text-slate-600 hover:bg-white"
+        >
+          重试
+        </button>
+      )}
+    </div>
   )
 }
 

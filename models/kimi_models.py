@@ -1,5 +1,5 @@
 """
-火山引擎Kimi模型API的请求和响应数据结构
+Kimi 模型 API 的请求和响应数据结构（基于月之暗面接口）
 """
 
 from typing import List, Optional, Dict, Any, Literal

@@ -196,7 +196,7 @@ class RecommendationStorageService:
         params["limit"] = limit
         params["offset"] = offset
 
-        with self._conn:
+        with self._lock, self._conn:
             rows = self._conn.execute(sql, params).fetchall()
 
         results: List[Dict[str, Any]] = []

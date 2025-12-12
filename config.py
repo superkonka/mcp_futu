@@ -40,6 +40,9 @@ class Settings(BaseSettings):
     kimi_api_key: Optional[str] = None
     kimi_moonshot_key: Optional[str] = None
     deepseek_api_key: Optional[str] = None
+    deepseek_base_url: Optional[str] = None
+    deepseek_model: Optional[str] = None
+    deepseek_fundamental_model: Optional[str] = None
     gemini_api_key: Optional[str] = None
     gemini_model: Optional[str] = None
 

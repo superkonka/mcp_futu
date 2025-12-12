@@ -4,6 +4,7 @@ import contextlib
 from collections import defaultdict
 from typing import Dict, Any, Optional, TYPE_CHECKING
 from datetime import datetime
+import time
 
 import futu as ft
 import pandas as pd
@@ -79,8 +80,15 @@ class DashboardStreamManager:
         self.kline_tasks: Dict[str, asyncio.Task] = {}
         self.kline_poll_interval = 30
         self.kline_latest_ts: Dict[str, str] = {}
+        self._quote_ctx_started = False
+        self.heartbeat_interval = 5
+        self._heartbeat_task: Optional[asyncio.Task] = None
         if self.quote_ctx:
             self._register_handlers()
+            self._ensure_quote_ctx_started()
+        self._quote_log_ts: Dict[str, float] = defaultdict(float)
+        self._broadcast_log_ts: Dict[str, float] = defaultdict(float)
+        self._start_heartbeat()
 
     def _register_handlers(self):
         self.quote_ctx.set_handler(self.StockQuoteHandler(self))
@@ -114,6 +122,12 @@ class DashboardStreamManager:
         snapshot = self._compose_snapshot(code)
         if snapshot:
             await queue.put(snapshot)
+        logger.info(
+            "[dashboard.stream.session.attach] session={} code={} snapshot_keys={}",
+            session_id,
+            code,
+            list(snapshot.keys()) if snapshot else [],
+        )
         return queue
 
     async def release_stream(self, session_id: str):
@@ -121,6 +135,7 @@ class DashboardStreamManager:
         if queue:
             while not queue.empty():
                 queue.get_nowait()
+        logger.info("[dashboard.stream.session.release] session={}", session_id)
         # 保留session映射，避免取消订阅
 
     async def detach_session(self, session_id: str):
@@ -173,6 +188,9 @@ class DashboardStreamManager:
 
     def update_state(self, code: str, kind: str, payload: Any):
         state = self.code_state[code]
+        previous = state.get(kind)
+        if self._is_same_payload(previous, payload, kind):
+            return
         state[kind] = payload
         if kind == "kline" and self.kline_storage:
             try:
@@ -180,6 +198,8 @@ class DashboardStreamManager:
                 self.kline_storage.save_batch(code, records)
             except Exception as exc:
                 logger.debug(f"kline storage save failed: {exc}")
+        if kind == "quote":
+            self._log_quote_update(code, payload)
         self._broadcast(code)
 
     def _ensure_kline_poll(self, code: str):
@@ -233,6 +253,21 @@ class DashboardStreamManager:
             return
         self._guard_task = self.loop.create_task(self._subscription_guard())
 
+    def _start_heartbeat(self):
+        if self._heartbeat_task:
+            return
+        self._heartbeat_task = self.loop.create_task(self._heartbeat_loop())
+
+    def _ensure_quote_ctx_started(self):
+        if not self.quote_ctx or self._quote_ctx_started:
+            return
+        try:
+            self.quote_ctx.start()
+            self._quote_ctx_started = True
+            logger.info("🚀 DashboardStreamManager 已启动富途推送线程")
+        except Exception as exc:
+            logger.error(f"启动富途推送线程失败: {exc}")
+
     async def _maybe_stop_guard(self):
         if self._guard_task and not self.code_sessions:
             self._guard_task.cancel()
@@ -265,17 +300,56 @@ class DashboardStreamManager:
         snapshot.update(self.code_state[code])
         return snapshot
 
+    async def _heartbeat_loop(self):
+        while True:
+            try:
+                await asyncio.sleep(self.heartbeat_interval)
+                timestamp = datetime.now().isoformat()
+                codes = list(self.code_sessions.keys())
+                if not codes:
+                    continue
+                payload = {
+                    "timestamp": timestamp,
+                    "heartbeat": True
+                }
+                for code in codes:
+                    self._broadcast_payload(code, payload)
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.debug(f"heartbeat loop error: {exc}")
+
     def _broadcast(self, code: str):
         if code not in self.code_sessions:
             return
         snapshot = self._compose_snapshot(code)
         if not snapshot:
             return
+        self._broadcast_payload(code, snapshot)
+
+    def _broadcast_payload(self, code: str, payload: Dict[str, Any]):
+        if code not in self.code_sessions:
+            return
+        now = time.time()
+        last_log = self._broadcast_log_ts.get(code, 0)
+        should_log = now - last_log > 2
         for session_id in list(self.code_sessions[code]):
             queue = self.session_queues.get(session_id)
             if not queue:
                 continue
-            self.loop.call_soon_threadsafe(self._queue_put, queue, snapshot)
+            message = dict(payload)
+            message["code"] = code
+            self.loop.call_soon_threadsafe(self._queue_put, queue, message)
+            if should_log:
+                logger.debug(
+                    "[dashboard.stream.broadcast] code={} session={} payload_keys={} queue_size={}",
+                    code,
+                    session_id,
+                    list(message.keys()),
+                    queue.qsize() if hasattr(queue, "qsize") else "n/a",
+                )
+        if should_log:
+            self._broadcast_log_ts[code] = now
 
     @staticmethod
     def _queue_put(queue: asyncio.Queue, payload: Dict[str, Any]):
@@ -287,6 +361,35 @@ class DashboardStreamManager:
             pass
         except Exception:
             pass
+
+    def _log_quote_update(self, code: str, payload: Dict[str, Any]):
+        now = time.time()
+        last = self._quote_log_ts.get(code, 0)
+        if now - last < 1:
+            return
+        self._quote_log_ts[code] = now
+        price = payload.get("price")
+        change = payload.get("change_rate")
+        ts = payload.get("update_time")
+        logger.debug(
+            "[dashboard.stream.quote] code={} price={} change_rate={} update_time={}",
+            code,
+            price,
+            change,
+            ts,
+        )
+
+    @staticmethod
+    def _is_same_payload(previous: Any, current: Any, kind: str) -> bool:
+        if previous is None:
+            return False
+        if kind == "quote" and isinstance(previous, dict) and isinstance(current, dict):
+            keys = ("price", "change_rate", "update_time")
+            return all(previous.get(k) == current.get(k) for k in keys)
+        try:
+            return previous == current
+        except Exception:
+            return False
 
     class StockQuoteHandler(ft.StockQuoteHandlerBase):
         def __init__(self, manager: "DashboardStreamManager"):

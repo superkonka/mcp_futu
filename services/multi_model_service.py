@@ -39,6 +39,10 @@ def _safe_json_loads(text: str) -> Optional[Dict[str, Any]]:
 class MultiModelAnalysisService:
     def __init__(self, deepseek: Optional[DeepSeekService]):
         self.deepseek = deepseek
+        self._context_limits = {
+            "default": 20000,
+            "kimi": 6000,
+        }
 
     async def run_analysis(
         self,
@@ -103,7 +107,8 @@ class MultiModelAnalysisService:
         self, model: str, context_text: str, code: str, question: Optional[str]
     ) -> Dict[str, Any]:
         begin = datetime.now()
-        prompt = self._build_model_prompt(model, context_text, code, question)
+        context_for_model = self._prepare_context_text(model, context_text)
+        prompt = self._build_model_prompt(model, context_for_model, code, question)
         try:
             if model == "deepseek":
                 if not self.deepseek or not self.deepseek.is_configured():
@@ -122,17 +127,12 @@ class MultiModelAnalysisService:
                         model=self.deepseek.fundamental_model,
                     )
             elif model == "kimi":
-                if not getattr(kimi_service, "provider", None):
+                if not kimi_service.is_configured():
                     return {"model": model, "status": "disabled", "error": "Kimi API 未配置"}
                 from models.kimi_models import KimiChatRequest, KimiChatMessage
 
-                default_model = (
-                    "moonshot-v1-8k"
-                    if getattr(kimi_service, "provider", None) == "moonshot"
-                    else "kimi-k2-thinking-turbo"
-                )
                 request_body = KimiChatRequest(
-                    model=default_model,
+                    model="kimi-k2-thinking-turbo",
                     messages=[
                         KimiChatMessage(role="system", content="你是一名专业的港股量化交易顾问。"),
                         KimiChatMessage(role="user", content=prompt),
@@ -179,22 +179,18 @@ class MultiModelAnalysisService:
         code: str,
         question: Optional[str],
     ) -> Dict[str, Any]:
-        prompt = self._build_judge_prompt(model, context_text, base_results, code, question)
+        context_for_model = self._prepare_context_text(model, context_text)
+        prompt = self._build_judge_prompt(model, context_for_model, base_results, code, question)
         try:
             if model == "gemini" and gemini_service.is_configured():
                 content = await gemini_service.generate_text(prompt, temperature=0.2)
             elif model == "deepseek" and self.deepseek and self.deepseek.is_configured():
                 content = await self.deepseek.chat("你是量化策略评审专家。", prompt, temperature=0.2)
-            elif model == "kimi" and getattr(kimi_service, "provider", None):
+            elif model == "kimi" and kimi_service.is_configured():
                 from models.kimi_models import KimiChatRequest, KimiChatMessage
 
-                default_model = (
-                    "moonshot-v1-8k"
-                    if getattr(kimi_service, "provider", None) == "moonshot"
-                    else "kimi-k2-thinking-turbo"
-                )
                 request_body = KimiChatRequest(
-                    model=default_model,
+                    model="kimi-k2-thinking-turbo",
                     messages=[
                         KimiChatMessage(role="system", content="你是一名策略评审官，需整合多模型意见输出唯一执行方案。"),
                         KimiChatMessage(role="user", content=prompt),
@@ -248,6 +244,15 @@ class MultiModelAnalysisService:
             "务必只输出 JSON，不要添加解释或 Markdown 代码框。"
             f"{extra}"
         )
+
+    def _prepare_context_text(self, model: str, context_text: str) -> str:
+        limit = self._context_limits.get(model, self._context_limits["default"])
+        if limit and len(context_text) > limit:
+            half = max(2000, limit // 2)
+            trimmed = context_text[:half] + "\n...\n" + context_text[-half:]
+            logger.debug(f"multi-model {model} 上下文过长，截断至 {len(trimmed)} 字符（原始 {len(context_text)}）")
+            return trimmed
+        return context_text
 
     def _build_judge_prompt(
         self,

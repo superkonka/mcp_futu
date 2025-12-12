@@ -77,14 +77,19 @@ class FundamentalNewsStorage:
             self._conn.commit()
 
     @staticmethod
-    def make_unique_key(code: str, title: str, url: str) -> str:
-        base = f"{code}|{title or ''}|{url or ''}"
+    def make_unique_key(code: str, title: str, url: str, publish_time: Optional[str] = None) -> str:
+        base = f"{code}|{title or ''}|{url or ''}|{publish_time or ''}"
         return hashlib.sha256(base.encode("utf-8")).hexdigest()
 
     def upsert(self, record: Dict[str, Any]):
         now = datetime.utcnow().isoformat()
         rec = record.copy()
-        unique_key = rec.get("unique_key") or self.make_unique_key(rec.get("code", ""), rec.get("title", ""), rec.get("url", ""))
+        unique_key = rec.get("unique_key") or self.make_unique_key(
+            rec.get("code", ""),
+            rec.get("title", ""),
+            rec.get("url", ""),
+            rec.get("publish_time") or rec.get("raw_publish_time")
+        )
         analysis = rec.get("analysis") or {}
         tags = analysis.get("themes") or []
         opportunities = analysis.get("opportunity_factors") or []

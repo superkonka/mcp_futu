@@ -115,7 +115,7 @@ MCP_TOOLS = [
     },
     {
         "name": "get_kimi_chat",
-        "description": "🔥 火山引擎Kimi对话 - 通过火山引擎ark API调用kimi-k2-thinking-turbo模型进行智能对话",
+        "description": "🔥 Kimi对话 - 通过月之暗面官方 API 驱动 kimi-k2-thinking-turbo 模型进行智能对话",
         "inputSchema": {
             "type": "object",
             "properties": {

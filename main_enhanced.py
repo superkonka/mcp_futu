@@ -8,6 +8,7 @@ import asyncio
 import time
 import secrets
 import json
+import re
 from pathlib import Path
 from datetime import datetime, timedelta, timezone, time as dtime
 from email.utils import parsedate_to_datetime
@@ -94,7 +95,17 @@ async def lifespan(app: FastAPI):
         minute_kline_storage = MinuteKlineStorage(db_path="data/minute_kline.db")
         logger.info("✅ 分钟级K线存储初始化成功")
         if settings.deepseek_api_key:
-            deepseek_service = DeepSeekService(settings.deepseek_api_key)
+            # 如果使用 Speciale base_url 且未指定模型，自动使用 special 模型名
+            base_url = settings.deepseek_base_url or "https://api.deepseek.com/v1/chat/completions"
+            is_speciale = "speciale" in (base_url or "").lower()
+            default_model = "deepseek-v3.2-speciale" if is_speciale else "deepseek-v3.2"
+            default_fundamental_model = default_model
+            deepseek_service = DeepSeekService(
+                settings.deepseek_api_key,
+                base_url=base_url,
+                model=settings.deepseek_model or default_model,
+                fundamental_model=settings.deepseek_fundamental_model or default_fundamental_model,
+            )
             logger.info("✅ DeepSeek分析服务已启用")
         else:
             logger.warning("⚠️ DeepSeek API KEY 未配置，基本面高级分析不可用")
@@ -108,8 +119,8 @@ async def lifespan(app: FastAPI):
         # 本地密钥检查（不影响服务启动，但提醒用户）
         if not settings.metaso_api_key:
             logger.warning("⚠️ Metaso API 密钥未配置。本地使用请在 .env 设置 METASO_API_KEY。")
-        if not settings.kimi_api_key:
-            logger.warning("⚠️ Kimi API 密钥未配置。本地使用请在 .env 设置 KIMI_API_KEY。")
+        if not (settings.kimi_moonshot_key or settings.kimi_api_key):
+            logger.warning("⚠️ Kimi API 密钥未配置。本地使用请在 .env 设置 KIMI_MOONSHOT_KEY。")
         
         # 尝试连接富途OpenD
         if await futu_service.connect():
@@ -410,6 +421,7 @@ class MultiModelJudgeRequest(BaseModel):
 class FundamentalNewsRefreshRequest(BaseModel):
     code: str = Field(..., description="股票代码, 如 HK.00700")
     size: int = Field(10, ge=10, le=100, description="Metaso 搜索数量")
+    days: int = Field(3, ge=1, le=30, description="限定最近N天的资讯，默认3天")
 
 
 @app.post("/api/analysis/multi_model",
@@ -838,10 +850,128 @@ async def _fetch_holding_snapshot(code: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-async def _fetch_news_signals(code: str, size: int = 12) -> Dict[str, List[Dict[str, Any]]]:
-    signals = {"bullish": [], "bearish": [], "neutral": []}
-    if not fundamental_service.is_configured():
-        return signals
+async def _fetch_news_signals(code: str, size: int = 12, refresh: bool = True, days: int = 3) -> Dict[str, List[Dict[str, Any]]]:
+    signals = {"bullish": [], "bearish": [], "neutral": [], "sector_news": [], "macro_news": []}
+    run_remote = refresh and fundamental_service.is_configured()
+    days = max(1, min(int(days or 3), 30))
+    now_utc = datetime.now(timezone.utc)
+    cutoff_dt = now_utc - timedelta(days=days)
+    max_dt = now_utc + timedelta(days=1)  # 防止未来日期污染
+
+    def _normalize_publish_time(value: Optional[Any]) -> Optional[str]:
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            ts = float(value)
+            if ts > 1e12:
+                ts = ts / 1000.0
+            try:
+                return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+            except Exception:
+                return None
+        text = str(value).strip()
+        if not text:
+            return None
+        lower = text.lower()
+        # 相对时间处理
+        if lower in {"刚刚", "刚才", "just now", "now"}:
+            return now_utc.isoformat()
+        rel_match = re.match(r"(\d+)\s*(分钟|分|小时|天|日)\s*前?$", text)
+        if rel_match:
+            amount = int(rel_match.group(1))
+            unit = rel_match.group(2)
+            delta_kwargs = {}
+            if unit in {"分钟", "分"}:
+                delta_kwargs["minutes"] = amount
+            elif unit in {"小时"}:
+                delta_kwargs["hours"] = amount
+            elif unit in {"天", "日"}:
+                delta_kwargs["days"] = amount
+            if delta_kwargs:
+                return (now_utc - timedelta(**delta_kwargs)).isoformat()
+        if lower in {"昨天", "yesterday"}:
+            return (now_utc - timedelta(days=1)).isoformat()
+        # 直接解析时间戳/日期
+        try:
+            parsed = parsedate_to_datetime(text)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc).isoformat()
+        except Exception:
+            pass
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S", "%Y-%m-%d", "%Y/%m/%d", "%m-%d", "%m/%d"):
+            try:
+                dt = datetime.strptime(text, fmt)
+                if fmt in ("%m-%d", "%m/%d"):
+                    dt = dt.replace(year=now_utc.year)
+                return dt.replace(tzinfo=timezone.utc).isoformat()
+            except Exception:
+                continue
+        # 手工提取数字日期
+        digits = re.findall(r"\d+", text)
+        if len(digits) >= 3:
+            year, month, day = digits[0], digits[1], digits[2]
+            hour = digits[3] if len(digits) > 3 else "0"
+            minute = digits[4] if len(digits) > 4 else "0"
+            second = digits[5] if len(digits) > 5 else "0"
+            try:
+                dt = datetime(
+                    int(year),
+                    int(month),
+                    int(day),
+                    int(hour),
+                    int(minute),
+                    int(second),
+                    tzinfo=timezone.utc
+                )
+                return dt.isoformat()
+            except Exception:
+                pass
+        return None
+
+
+    async def _build_search_query() -> str:
+        def _ensure_recent(q: str) -> str:
+            text = q.lower()
+            recency_token = f"最近{days}天"
+            recent_tokens = [
+                "最近", "本周", "过去", "近一周", "last 7 days", "past week", "today", "yesterday", "last week",
+                recency_token.lower(), f"近{days}天", f"{days}天"
+            ]
+            if any(tok.lower() in text for tok in recent_tokens):
+                return q
+            return f"{q} {recency_token}"
+
+        default_query = _ensure_recent(f"{code} 最新 股票新闻 基本面")
+        if not run_remote or not deepseek_service or not deepseek_service.is_configured():
+            return default_query
+        company_name = code
+        try:
+            quote_info = await _fetch_quote_snapshot(code)
+            if quote_info and quote_info.get("name"):
+                company_name = str(quote_info["name"])
+        except Exception:
+            company_name = code
+        prompt = (
+            "你是金融情报检索专家。请基于股票代码和公司名称，提供一个用于新闻搜索的简短中文关键词，"
+            "聚焦基本面、财报、政策或竞争情报，不超过18个汉字。"
+            '输出 JSON，如 {"query": "美团 基本面 财报"}。'
+            f"\n股票代码: {code}\n公司名称: {company_name}"
+        )
+        try:
+            raw = await deepseek_service.chat("你是资讯检索专家。", prompt, temperature=0.2)
+            if raw:
+                text = raw.strip().strip('`')
+                if text.lower().startswith("json"):
+                    text = text[4:].lstrip()
+                data = json.loads(text)
+                if isinstance(data, dict):
+                    query = data.get("query")
+                    if isinstance(query, str) and query.strip():
+                        return _ensure_recent(query.strip())
+        except Exception as exc:
+            logger.debug(f"生成检索关键词失败: {exc}")
+        return default_query
 
     def _build_code_tokens(symbol: str) -> List[str]:
         base = symbol.upper()
@@ -853,21 +983,36 @@ async def _fetch_news_signals(code: str, size: int = 12) -> Dict[str, List[Dict[
         return [token for token in tokens if token]
 
     code_tokens = _build_code_tokens(code)
+    search_query = await _build_search_query()
 
-    def _is_related_article(record: Dict[str, Any], analysis: Optional[Dict[str, Any]]) -> bool:
-        if analysis and "related" in analysis:
-            related_val = analysis.get("related")
-            if isinstance(related_val, bool):
-                return related_val
-            if isinstance(related_val, (int, float)):
-                return related_val >= 0.5
+    def _has_code_token(record: Dict[str, Any]) -> bool:
         title = (record.get("title") or "").upper()
         snippet = (record.get("snippet") or "").upper()
         merged = f"{title} {snippet}"
-        for token in code_tokens:
-            if token and token in merged:
-                return True
-        return False
+        return any(token and token in merged for token in code_tokens)
+
+    def _classify_scope(record: Dict[str, Any], analysis: Optional[Dict[str, Any]]) -> str:
+        # 优先：如果当前请求的 code 与记录的 code 一致，直接视为 direct，防止被误判为 sector/macro
+        if record.get("code") and record.get("code") == code:
+            return "direct"
+        if analysis:
+            scope = analysis.get("related_scope")
+            if isinstance(scope, str):
+                scope_lower = scope.lower()
+                if scope_lower in {"direct", "sector", "macro"}:
+                    if scope_lower == "direct" and not _has_code_token(record):
+                        return "sector"
+                    return scope_lower
+            related_val = analysis.get("related")
+            if isinstance(related_val, bool):
+                if related_val and _has_code_token(record):
+                    return "direct"
+                if related_val:
+                    return "sector"
+                return "macro"
+        if _has_code_token(record):
+            return "direct"
+        return "macro"
 
     def _fallback_analysis(text: str) -> Dict[str, Any]:
         lowered = text.lower()
@@ -876,6 +1021,7 @@ async def _fetch_news_signals(code: str, size: int = 12) -> Dict[str, List[Dict[
             sentiment = "bearish"
         elif any(key.lower() in lowered for key in BULLISH_KEYWORDS):
             sentiment = "bullish"
+        scope = "direct" if any(token.lower() in lowered for token in code_tokens) else "macro"
         return {
             "sentiment": sentiment,
             "confidence": 0.4,
@@ -886,7 +1032,9 @@ async def _fetch_news_signals(code: str, size: int = 12) -> Dict[str, List[Dict[
             "opportunity_factors": [],
             "summary": text[:100],
             "action_hint": "",
-            "related": any(token.lower() in text.lower() for token in code_tokens)
+            "related": scope == "direct",
+            "related_scope": scope,
+            "analysis_provider": "fallback"
         }
 
     async def _ensure_analysis(item: Dict[str, Any]) -> Dict[str, Any]:
@@ -940,7 +1088,7 @@ async def _fetch_news_signals(code: str, size: int = 12) -> Dict[str, List[Dict[
 
     try:
         request = FundamentalSearchRequest(
-            q=f"{code} 最新 股票新闻 基本面",
+            q=search_query,
             scope="news",
             includeSummary=True,
             size=min(max(size, 10), 100),
@@ -949,112 +1097,204 @@ async def _fetch_news_signals(code: str, size: int = 12) -> Dict[str, List[Dict[
         )
         response = await fundamental_service.search_fundamental_info(request)
         results = response.results or []
-        for item in results[:8]:
+        fetched_count = len(results)
+        kept_count = 0
+        new_count = 0
+        updated_count = 0
+        skipped_no_time = 0
+        skipped_cutoff = 0
+        max_items = min(len(results), size)
+        for item in results[:max_items]:
+            raw_publish_time = item.publish_time
+            normalized_publish_time = _normalize_publish_time(raw_publish_time)
+            if cutoff_dt:
+                if not normalized_publish_time:
+                    # 缺失或无法解析发布时间，跳过，避免时间轴被旧数据污染
+                    skipped_no_time += 1
+                    continue
+                try:
+                    dt = datetime.fromisoformat(normalized_publish_time.replace("Z", "+00:00"))
+                    if dt < cutoff_dt or dt > max_dt:
+                        skipped_cutoff += 1
+                        continue
+                except Exception:
+                    skipped_no_time += 1
+                    continue
             record = {
                 "code": code,
                 "title": item.title,
                 "url": item.url,
                 "source": item.source,
                 "snippet": item.snippet,
-                "publish_time": item.publish_time,
+                "raw_publish_time": raw_publish_time,
+                "publish_time": normalized_publish_time or raw_publish_time or now_utc.isoformat(),
             }
             unique_key = None
             stored = None
             if fundamental_storage:
-                unique_key = fundamental_storage.make_unique_key(code, item.title or "", item.url or "")
+                unique_key = fundamental_storage.make_unique_key(
+                    code,
+                    item.title or "",
+                    item.url or "",
+                    normalized_publish_time or raw_publish_time
+                )
                 stored = fundamental_storage.get_by_unique_key(unique_key)
             analysis = stored.get("analysis") if stored and stored.get("analysis") else None
             if not analysis:
                 analysis = await _ensure_analysis(record)
-            if not _is_related_article(record, analysis):
+            scope = _classify_scope(record, analysis)
+            if scope != "direct":
                 logger.info(
-                    "[fundamental.filter] 丢弃非相关新闻 code=%s title=%s", code, record.get("title")
+                    f"[fundamental.filter] 识别为{scope}级资讯 code={code} title={record.get('title')}"
                 )
-                continue
             record["analysis"] = analysis
             if fundamental_storage:
                 record["unique_key"] = unique_key
+                existed = bool(stored)
                 fundamental_storage.upsert(record)
+                if existed:
+                    updated_count += 1
+                else:
+                    new_count += 1
+            kept_count += 1
+        logger.info(
+            f"[fundamental.refresh] code={code} fetched={fetched_count} kept={kept_count} "
+            f"new={new_count} updated={updated_count} "
+            f"skip_no_time={skipped_no_time} skip_cutoff={skipped_cutoff} days={days}"
+        )
     except Exception as exc:
         logger.debug(f"基本面增量搜索失败: {exc}")
 
-    refresh_quota = max(3, min(10, max(size // 2, 1)))
-    await _repair_existing_records(quota=refresh_quota)
+    if run_remote:
+        refresh_quota = max(3, min(10, max(size // 2, 1)))
+        await _repair_existing_records(quota=refresh_quota)
 
-    stored_records: List[Dict[str, Any]] = []
-    if fundamental_storage:
-        stored_records = fundamental_storage.get_recent_news(code, limit=40)
-        stored_records = [rec for rec in stored_records if _is_related_article(rec, rec.get("analysis"))]
+    def _build_cached_news_signals() -> Dict[str, List[Dict[str, Any]]]:
+        local_signals = {key: [] for key in signals.keys()}
+        stored_records: List[Dict[str, Any]] = []
+        sector_records: List[Dict[str, Any]] = []
+        macro_records: List[Dict[str, Any]] = []
+        preview_times: List[str] = []
 
-    if not stored_records:
-        return signals
+        def _sort_key_by_time(rec: Dict[str, Any]):
+            pt = rec.get("publish_time") or rec.get("last_seen") or rec.get("first_seen") or ""
+            norm = _normalize_publish_time(pt) if pt else None
+            try:
+                return datetime.fromisoformat((norm or "").replace("Z", "+00:00"))
+            except Exception:
+                return datetime.min
 
-    daily_buckets: Dict[str, Dict[str, Dict[str, float]]] = defaultdict(
-        lambda: {
-            "counts": {"bullish": 0.0, "bearish": 0.0, "neutral": 0.0},
-            "weights": {"bullish": 0.0, "bearish": 0.0, "neutral": 0.0}
-        }
-    )
+        if fundamental_storage:
+            raw_records = fundamental_storage.get_recent_news(code, limit=40)
+            # 按发布时间降序排序，避免字符串排序导致新数据被埋
+            raw_records_sorted = sorted(raw_records, key=_sort_key_by_time, reverse=True)
+            for rec in raw_records_sorted:
+                if rec.get("code") and rec.get("code") != code:
+                    continue
+                scope = _classify_scope(rec, rec.get("analysis"))
+                if scope == "direct":
+                    stored_records.append(rec)
+                elif scope == "sector":
+                    sector_records.append(rec)
+                else:
+                    macro_records.append(rec)
+        if not stored_records:
+            logger.info(f"[fundamental.signals.cache] code={code} 本地无direct资讯，sector={len(sector_records)} macro={len(macro_records)}")
+            local_signals["daily_metrics"] = []
+            return local_signals
+        logger.info(
+            f"[fundamental.signals.cache.raw] code={code} direct={len(stored_records)} sector={len(sector_records)} macro={len(macro_records)}"
+        )
+        daily_buckets: Dict[str, Dict[str, Dict[str, float]]] = defaultdict(
+            lambda: {
+                "counts": {"bullish": 0.0, "bearish": 0.0, "neutral": 0.0},
+                "weights": {"bullish": 0.0, "bearish": 0.0, "neutral": 0.0}
+            }
+        )
+        for rec in stored_records:
+            analysis = rec.get("analysis") or {}
+            raw_sentiment = analysis.get("sentiment") or "neutral"
+            sentiment = "neutral"
+            if raw_sentiment in ("bullish", "利好", "看涨"):
+                sentiment = "bullish"
+            elif raw_sentiment in ("bearish", "利空", "看跌"):
+                sentiment = "bearish"
+            publish_time_val = rec.get("publish_time") or rec.get("last_seen") or rec.get("first_seen")
+            normalized_publish_time = _normalize_publish_time(publish_time_val) if publish_time_val else None
+            if normalized_publish_time and len(preview_times) < 3:
+                preview_times.append(normalized_publish_time)
+            entry = {
+                "title": rec.get("title"),
+                "snippet": rec.get("snippet"),
+                "source": rec.get("source"),
+                "url": rec.get("url"),
+                "publish_time": normalized_publish_time or publish_time_val,
+                "published_at": normalized_publish_time or publish_time_val,
+                "analysis": analysis
+            }
+            local_signals.setdefault(sentiment, []).append(entry)
+            publish_date = (normalized_publish_time or publish_time_val or "")[:10]
+            if publish_date:
+                bucket = daily_buckets[publish_date]
+                bucket["counts"][sentiment] += 1
+                impact_score = float(analysis.get("impact_score") or 50)
+                novelty_score = float(analysis.get("novelty_score") or analysis.get("magnitude_score") or 50)
+                weight = max(0.1, min((impact_score * 0.7 + novelty_score * 0.3) / 100, 2.0))
+                if analysis.get("effectiveness") == "stale":
+                    weight *= 0.3
+                elif analysis.get("effectiveness") == "diminished":
+                    weight *= 0.6
+                bucket["weights"][sentiment] += weight
+        daily_metrics = []
+        for date, bucket in sorted(daily_buckets.items(), key=lambda x: x[0], reverse=True):
+            counts = bucket["counts"]
+            weights = bucket["weights"]
+            total = counts["bullish"] + counts["bearish"] + counts["neutral"]
+            total_weight = weights["bullish"] + weights["bearish"] + weights["neutral"]
+            if total == 0:
+                continue
+            weight_score = (weights["bullish"] - weights["bearish"]) / total_weight if total_weight else 0.0
+            score = (counts["bullish"] - counts["bearish"]) / total
+            daily_metrics.append({
+                "date": date,
+                "bullish": counts["bullish"],
+                "bearish": counts["bearish"],
+                "neutral": counts["neutral"],
+                "score": round(score, 2),
+                "weighted_score": round(weight_score, 2)
+            })
+        local_signals["daily_metrics"] = daily_metrics
+        local_signals["sector_news"] = [
+            {
+                "title": rec.get("title"),
+                "snippet": rec.get("snippet"),
+                "source": rec.get("source"),
+                "url": rec.get("url"),
+                "publish_time": _normalize_publish_time(rec.get("publish_time") or rec.get("last_seen") or rec.get("first_seen")) or rec.get("publish_time"),
+                "analysis": rec.get("analysis"),
+            }
+            for rec in sector_records
+        ]
+        local_signals["macro_news"] = [
+            {
+                "title": rec.get("title"),
+                "snippet": rec.get("snippet"),
+                "source": rec.get("source"),
+                "url": rec.get("url"),
+                "publish_time": _normalize_publish_time(rec.get("publish_time") or rec.get("last_seen") or rec.get("first_seen")) or rec.get("publish_time"),
+                "analysis": rec.get("analysis"),
+            }
+            for rec in macro_records
+        ]
+        logger.info(
+            f"[fundamental.signals.cache] code={code} bullish={len(local_signals.get('bullish', []))} "
+            f"bearish={len(local_signals.get('bearish', []))} total_direct={len(stored_records)} "
+            f"sector={len(sector_records)} macro={len(macro_records)} "
+            f"top_publish_time={preview_times}"
+        )
+        return local_signals
 
-    for rec in stored_records:
-        analysis = rec.get("analysis") or {}
-        raw_sentiment = analysis.get("sentiment") or "neutral"
-        sentiment = "neutral"
-        if raw_sentiment in ("bullish", "利好", "看涨"):
-            sentiment = "bullish"
-        elif raw_sentiment in ("bearish", "利空", "看跌"):
-            sentiment = "bearish"
-        entry = {
-            "title": rec.get("title"),
-            "snippet": rec.get("snippet"),
-            "source": rec.get("source"),
-            "url": rec.get("url"),
-            "publish_time": rec.get("publish_time"),
-            "published_at": rec.get("publish_time"),
-            "analysis": analysis
-        }
-        signals.setdefault(sentiment, []).append(entry)
-        publish_date = (rec.get("publish_time") or rec.get("last_seen") or "")[:10]
-        if publish_date:
-            bucket = daily_buckets[publish_date]
-            bucket["counts"][sentiment] += 1
-            impact_score = float(analysis.get("impact_score") or 50)
-            novelty_score = float(analysis.get("novelty_score") or analysis.get("magnitude_score") or 50)
-            weight = max(0.1, min((impact_score * 0.7 + novelty_score * 0.3) / 100, 2.0))
-            if analysis.get("effectiveness") == "stale":
-                weight *= 0.3
-            elif analysis.get("effectiveness") == "diminished":
-                weight *= 0.6
-            bucket["weights"][sentiment] += weight
-
-    daily_metrics = []
-    for date, bucket in sorted(daily_buckets.items(), key=lambda x: x[0], reverse=True):
-        counts = bucket["counts"]
-        weights = bucket["weights"]
-        total = counts["bullish"] + counts["bearish"] + counts["neutral"]
-        total_weight = weights["bullish"] + weights["bearish"] + weights["neutral"]
-        if total == 0:
-            continue
-        weight_score = 0.0
-        if total_weight:
-            weight_score = (weights["bullish"] - weights["bearish"]) / total_weight
-        score = (counts["bullish"] - counts["bearish"]) / total
-        daily_metrics.append({
-            "date": date,
-            "bullish": counts["bullish"],
-            "bearish": counts["bearish"],
-            "neutral": counts["neutral"],
-            "score": round(score, 2),
-            "weighted_score": round(weight_score, 2)
-        })
-    signals["daily_metrics"] = daily_metrics
-
-    logger.info(
-        f"[fundamental.signals.deepseek] code={code} bullish={len(signals.get('bullish', []))} "
-        f"bearish={len(signals.get('bearish', []))}"
-    )
-    return signals
-
+    return _build_cached_news_signals()
 
 def _normalize_kline_cache_scope(request: HistoryKLineRequest) -> Tuple[str, str, str]:
     """生成用于缓存的K线范围标识，避免不同请求互相污染"""
@@ -2219,83 +2459,159 @@ async def delete_dashboard_session(session_id: str) -> Dict[str, Any]:
     return {"deleted": True, "session_id": session_id, "code": info.get("code")}
 
 
+DEFAULT_DASHBOARD_MODULES = {"core", "signals", "recommendations", "capital", "kline"}
+
+
 @app.get("/api/dashboard/bootstrap",
          operation_id="get_dashboard_bootstrap",
          summary="获取看板初始数据",
          tags=["dashboard"])
-async def get_dashboard_bootstrap(session: str) -> Dict[str, Any]:
+async def get_dashboard_bootstrap(session: str, modules: Optional[str] = None) -> Dict[str, Any]:
     data = _ensure_dashboard_session(session)
     code = data["code"]
-    start = time.time()
-    logger.info(f"[dashboard.bootstrap] session={session} code={code} fetch_start")
-    quote_task = asyncio.create_task(_fetch_quote_snapshot(code))
-    news_task = asyncio.create_task(_fetch_news_signals(code, 12))
-    rec_task = asyncio.create_task(_fetch_recommendations_snapshot(code))
-    holding_task = asyncio.create_task(_fetch_holding_snapshot(code))
-    start_date = (datetime.now() - timedelta(days=5)).strftime("%Y-%m-%d")
-    if futu_service:
-        flow_task = asyncio.create_task(
-            futu_service.get_capital_flow(CapitalFlowRequest(code=code, period_type=PeriodType.DAY, start=start_date))
-        )
-        distribution_task = asyncio.create_task(
-            futu_service.get_capital_distribution(CapitalDistributionRequest(code=code))
-        )
-        history_task = asyncio.create_task(
-            futu_service.get_history_kline(HistoryKLineRequest(code=code, ktype=KLType.K_1M, max_count=240))
-        )
-        current_task = asyncio.create_task(
-            futu_service.get_current_kline(
-                CurrentKLineRequest(code=code, num=240, ktype=KLType.K_1M, autype=AuType.QFQ)
-            )
-        )
-    else:
-        flow_task = asyncio.create_task(asyncio.sleep(0, result=None))
-        distribution_task = asyncio.create_task(asyncio.sleep(0, result=None))
-        history_task = asyncio.create_task(asyncio.sleep(0, result=None))
-        current_task = asyncio.create_task(asyncio.sleep(0, result=None))
-    quote, signals, recommendations, holding, flow_resp, distribution_resp, history_resp, current_resp = await asyncio.gather(
-        quote_task, news_task, rec_task, holding_task, flow_task, distribution_task, history_task, current_task
+    module_set = (
+        {m.strip().lower() for m in modules.split(",") if m.strip()} if modules else set(DEFAULT_DASHBOARD_MODULES)
     )
+    module_set &= DEFAULT_DASHBOARD_MODULES
+    if not module_set:
+        module_set = set(DEFAULT_DASHBOARD_MODULES)
+
+    start = time.time()
+    logger.info(f"[dashboard.bootstrap] session={session} code={code} modules={','.join(sorted(module_set))}")
+
+    def _noop_task(result=None):
+        return asyncio.create_task(asyncio.sleep(0, result=result))
+
+    tasks: Dict[str, asyncio.Task] = {}
+    if "core" in module_set:
+        tasks["quote"] = asyncio.create_task(_fetch_quote_snapshot(code))
+        tasks["holding"] = asyncio.create_task(_fetch_holding_snapshot(code))
+    if "signals" in module_set:
+        tasks["signals"] = asyncio.create_task(_fetch_news_signals(code, 12, refresh=False))
+    if "recommendations" in module_set:
+        tasks["recommendations"] = asyncio.create_task(_fetch_recommendations_snapshot(code))
+    if "capital" in module_set:
+        if futu_service:
+            start_date = (datetime.now() - timedelta(days=5)).strftime("%Y-%m-%d")
+            tasks["capital_flow"] = asyncio.create_task(
+                futu_service.get_capital_flow(
+                    CapitalFlowRequest(code=code, period_type=PeriodType.DAY, start=start_date)
+                )
+            )
+            tasks["capital_distribution"] = asyncio.create_task(
+                futu_service.get_capital_distribution(CapitalDistributionRequest(code=code))
+            )
+        else:
+            tasks["capital_flow"] = _noop_task()
+            tasks["capital_distribution"] = _noop_task()
+    if "kline" in module_set:
+        if futu_service:
+            tasks["history_kline"] = asyncio.create_task(
+                futu_service.get_history_kline(HistoryKLineRequest(code=code, ktype=KLType.K_1M, max_count=240))
+            )
+            tasks["current_kline"] = asyncio.create_task(
+                futu_service.get_current_kline(
+                    CurrentKLineRequest(code=code, num=240, ktype=KLType.K_1M, autype=AuType.QFQ)
+                )
+            )
+        else:
+            tasks["history_kline"] = _noop_task()
+            tasks["current_kline"] = _noop_task()
+
+    if tasks:
+        await asyncio.gather(*tasks.values(), return_exceptions=True)
+
+    def _task_result(key: str):
+        task = tasks.get(key)
+        if not task:
+            return None
+        if task.cancelled():
+            logger.warning(f"[dashboard.module.cancelled] session={session} module={key}")
+            return None
+        exc = task.exception()
+        if exc:
+            logger.warning(f"[dashboard.module.error] session={session} module={key} error={exc}")
+            return None
+        try:
+            return task.result()
+        except Exception as task_exc:
+            logger.warning(f"[dashboard.module.result_error] session={session} module={key} error={task_exc}")
+            return None
+
     history = data.get("history", [])
-    bootstrap = {
+    bootstrap: Dict[str, Any] = {
         "code": code,
         "session": {
             "session_id": session,
             "nickname": data.get("nickname"),
             "created_at": data.get("created_at")
         },
-        "signals": signals,
-        "recommendations": recommendations,
-        "holding": holding,
         "history": history[-60:]
     }
-    session_window = _get_session_window(code)
-    if quote:
-        bootstrap["quote"] = quote
-        if quote.get("prev_close") is not None:
-            session_window["previous_close"] = quote.get("prev_close")
-    if isinstance(flow_resp, APIResponse) and flow_resp.ret_code == 0:
-        bootstrap["capital_flow"] = flow_resp.data
-    if isinstance(distribution_resp, APIResponse) and distribution_resp.ret_code == 0:
-        bootstrap["capital_distribution"] = distribution_resp.data
-    history_data = history_resp.data.get("kline_data") if isinstance(history_resp, APIResponse) and history_resp.ret_code == 0 and history_resp.data else None
-    current_data = current_resp.data.get("kline_data") if isinstance(current_resp, APIResponse) and current_resp.ret_code == 0 and current_resp.data else None
-    merged_kline = _merge_kline_records(history_data, current_data)
-    if minute_kline_storage and merged_kline:
-        try:
-            minute_kline_storage.save_batch(code, merged_kline)
-            minute_kline_storage.delete_older_than(code, keep_limit=2880)
-            stored_recent = minute_kline_storage.fetch_recent(code, limit=720)
-            merged_kline = _merge_kline_records(stored_recent, merged_kline)
-        except Exception as exc:
-            logger.warning(f"分钟K线存储失败: {exc}")
-    if merged_kline:
-        bootstrap["history_kline"] = merged_kline
-    bootstrap["session_window"] = session_window
+
+    if "core" in module_set:
+        quote = _task_result("quote")
+        holding = _task_result("holding")
+        session_window = _get_session_window(code)
+        if quote:
+            bootstrap["quote"] = quote
+            if quote.get("prev_close") is not None:
+                session_window["previous_close"] = quote.get("prev_close")
+        if holding is not None:
+            bootstrap["holding"] = holding
+        bootstrap["session_window"] = session_window
+
+    if "signals" in module_set and "signals" in tasks:
+        signals_result = _task_result("signals")
+        if signals_result is not None:
+            bootstrap["signals"] = signals_result
+
+    if "recommendations" in module_set and "recommendations" in tasks:
+        rec_result = _task_result("recommendations")
+        if rec_result is not None:
+            bootstrap["recommendations"] = rec_result
+
+    if "capital" in module_set:
+        flow_resp = _task_result("capital_flow")
+        distribution_resp = _task_result("capital_distribution")
+        if flow_resp:
+            if isinstance(flow_resp, APIResponse) and flow_resp.ret_code == 0:
+                bootstrap["capital_flow"] = flow_resp.data
+        if distribution_resp:
+            if isinstance(distribution_resp, APIResponse) and distribution_resp.ret_code == 0:
+                bootstrap["capital_distribution"] = distribution_resp.data
+
+    if "kline" in module_set:
+        history_result = _task_result("history_kline")
+        current_result = _task_result("current_kline")
+        history_data = (
+            history_result.data.get("kline_data")
+            if isinstance(history_result, APIResponse)
+            and history_result.ret_code == 0
+            and history_result.data
+            else None
+        )
+        current_data = (
+            current_result.data.get("kline_data")
+            if isinstance(current_result, APIResponse)
+            and current_result.ret_code == 0
+            and current_result.data
+            else None
+        )
+        merged_kline = _merge_kline_records(history_data, current_data)
+        if minute_kline_storage and merged_kline:
+            try:
+                minute_kline_storage.save_batch(code, merged_kline)
+                minute_kline_storage.delete_older_than(code, keep_limit=2880)
+                stored_recent = minute_kline_storage.fetch_recent(code, limit=720)
+                merged_kline = _merge_kline_records(stored_recent, merged_kline)
+            except Exception as exc:
+                logger.warning(f"分钟K线存储失败: {exc}")
+        if merged_kline:
+            bootstrap["history_kline"] = merged_kline
+
     logger.info(
-        f"[dashboard.bootstrap.done] session={session} code={code} "
-        f"quote={'y' if quote else 'n'} signals={len(signals.get('bullish', []))+len(signals.get('bearish', []))} "
-        f"recs={len(recommendations)} holding={'y' if holding else 'n'} cost={time.time()-start:.3f}s"
+        f"[dashboard.bootstrap.done] session={session} code={code} modules={','.join(sorted(module_set))} cost={time.time()-start:.3f}s"
     )
     return bootstrap
 
@@ -2626,7 +2942,7 @@ async def refresh_fundamental_news(request: FundamentalNewsRefreshRequest) -> AP
     if not fundamental_service.is_configured():
         return APIResponse(ret_code=-1, ret_msg="Metaso API 密钥未配置，无法使用基本面搜索功能", data=None)
     try:
-        signals = await _fetch_news_signals(request.code, request.size)
+        signals = await _fetch_news_signals(request.code, request.size, days=request.days)
         return APIResponse(ret_code=0, ret_msg="刷新成功", data={"signals": signals})
     except Exception as e:
         logger.error(f"刷新基本面资讯失败: {e}")
