@@ -43,6 +43,9 @@ class Settings(BaseSettings):
     deepseek_base_url: Optional[str] = None
     deepseek_model: Optional[str] = None
     deepseek_fundamental_model: Optional[str] = None
+    deepseek_reasoner_model: Optional[str] = None
+    # 兼容拼写错误的环境变量
+    deepseek_reaspmer_model: Optional[str] = None
     gemini_api_key: Optional[str] = None
     gemini_model: Optional[str] = None
 

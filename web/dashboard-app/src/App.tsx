@@ -91,6 +91,7 @@ interface DailyMetric {
 }
 
 type TimelineNewsItem = SignalItem & {
+  code?: string
   sentiment: 'bullish' | 'bearish' | 'neutral'
   timestamp: number
 }
@@ -671,7 +672,1011 @@ const formatPriceDelta = (delta: number) => {
   return `${prefix}${delta.toFixed(2)}`
 }
 
+const sentimentStyles = {
+  bullish: {
+    dot: 'bg-emerald-500',
+    badge: 'bg-emerald-50 text-emerald-600',
+    border: 'hover:border-emerald-200/80'
+  },
+  bearish: {
+    dot: 'bg-rose-500',
+    badge: 'bg-rose-50 text-rose-500',
+    border: 'hover:border-rose-200/80'
+  },
+  neutral: {
+    dot: 'bg-slate-400',
+    badge: 'bg-slate-100 text-slate-500',
+    border: 'hover:border-slate-200'
+  }
+} as const
+
+const analysisProviderMeta: Record<string, { label: string; className: string }> = {
+  deepseek: { label: 'LLM分析', className: 'bg-blue-50 text-blue-600 border border-blue-100' },
+  fallback: { label: '关键词兜底', className: 'bg-amber-50 text-amber-700 border border-amber-100' },
+  pending: { label: '待分析', className: 'bg-slate-50 text-slate-500 border border-slate-200' },
+  fail: { label: '分析失败', className: 'bg-rose-50 text-rose-600 border border-rose-100' }
+}
+
+function renderInline(text: string): React.ReactNode {
+  if (!text) return null
+  const nodes: React.ReactNode[] = []
+  let remaining = text
+  const boldRe = /\*\*(.+?)\*\*/
+  while (true) {
+    const match = remaining.match(boldRe)
+    if (!match) break
+    const [full, inner] = match
+    const idx = match.index ?? 0
+    if (idx > 0) nodes.push(remaining.slice(0, idx))
+    nodes.push(<strong key={`${nodes.length}-b`}>{inner}</strong>)
+    remaining = remaining.slice(idx + full.length)
+  }
+  if (remaining) nodes.push(remaining)
+  return nodes
+}
+
+function renderMarkdown(md: string) {
+  if (!md) return null
+  const lines = md.split(/\r?\n/)
+  const blocks: React.ReactNode[] = []
+  let list: string[] | null = null
+  const flushList = () => {
+    if (list && list.length) {
+      blocks.push(
+        <ul key={`ul-${blocks.length}`} className="list-disc list-inside space-y-1 text-[13px] text-slate-800">
+          {list.map((li, idx) => (
+            <li key={idx}>{renderInline(li)}</li>
+          ))}
+        </ul>
+      )
+    }
+    list = null
+  }
+  lines.forEach((line) => {
+    const trimmed = line.trimEnd()
+    if (!trimmed) {
+      flushList()
+      return
+    }
+    const heading = trimmed.match(/^(#{1,3})\s+(.*)$/)
+    if (heading) {
+      flushList()
+      const level = heading[1].length
+      const content = heading[2]
+      const Tag = (`h${Math.min(level + 2, 6)}` as keyof JSX.IntrinsicElements) // use h3/h4/h5 for视觉
+      blocks.push(
+        <Tag key={`h-${blocks.length}`} className="font-semibold text-slate-900">
+          {renderInline(content)}
+        </Tag>
+      )
+      return
+    }
+    if (/^[-*+]\s+/.test(trimmed) || /^\d+\.\s+/.test(trimmed)) {
+      list = list || []
+      list.push(trimmed.replace(/^[-*+]\s+/, '').replace(/^\d+\.\s+/, ''))
+      return
+    }
+    flushList()
+    blocks.push(
+      <p key={`p-${blocks.length}`} className="text-[13px] text-slate-800 leading-6">
+        {renderInline(trimmed)}
+      </p>
+    )
+  })
+  flushList()
+  return <div className="space-y-2">{blocks}</div>
+}
+
+// ===== Fundamental Center (独立页) =====
+type FundamentalCenterProps = {
+  navigateTo?: (url: string) => void
+}
+
+function FundamentalCenter({ navigateTo }: FundamentalCenterProps) {
+  const [code, setCode] = useState(() => {
+    const params = new URLSearchParams(window.location.search)
+    return params.get('code') || ''
+  })
+  const [status, setStatus] = useState<'all' | 'pending' | 'fail' | 'done'>('all')
+  const [startDate, setStartDate] = useState(() => {
+    const d = new Date()
+    d.setDate(d.getDate() - 3)
+    return d.toISOString().slice(0, 10)
+  })
+  const [endDate, setEndDate] = useState(() => {
+    return new Date().toISOString().slice(0, 10)
+  })
+  const [limit, setLimit] = useState(50)
+  const [items, setItems] = useState<TimelineNewsItem[]>([])
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [reports, setReports] = useState<any[]>([])
+  const [reportLoading, setReportLoading] = useState(false)
+  const [reportGenerating, setReportGenerating] = useState<null | 'daily' | 'weekly'>(null)
+  const [selectedReport, setSelectedReport] = useState<any | null>(null)
+  const [watchlist, setWatchlist] = useState<Array<{ code: string; nickname?: string | null }>>([])
+  const [newWatchCode, setNewWatchCode] = useState('')
+  const [searchQuery, setSearchQuery] = useState('')
+  const [searchResults, setSearchResults] = useState<any[]>([])
+  const [searchLoading, setSearchLoading] = useState(false)
+  const [searchStep, setSearchStep] = useState<'idle' | 'searching' | 'analyzing' | 'storing' | 'done'>('idle')
+  const [batchAnalyzing, setBatchAnalyzing] = useState(false)
+  const analyzedReports = useMemo(() => {
+    return [...items]
+      .filter((item) => {
+        const provider = (item.analysis?.analysis_provider || '').toString().toLowerCase()
+        const hasSentiment = !!item.analysis?.sentiment
+        return provider && provider !== 'pending' && provider !== 'fail' && hasSentiment
+      })
+      .sort((a, b) => (parseNewsDate(b.publish_time || b.published_at) || 0) - (parseNewsDate(a.publish_time || a.published_at) || 0))
+      .slice(0, 8)
+  }, [items])
+
+  const fetchList = async () => {
+    setLoading(true)
+    setError(null)
+    try {
+      const payload: any = { code: code || undefined, limit }
+      if (status !== 'all') payload.status = status
+      if (startDate) payload.start_date = startDate
+      if (endDate) payload.end_date = endDate
+      const res = await fetch('/api/fundamental/news/list', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      })
+      if (!res.ok) throw new Error('加载失败')
+      const json = (await res.json()) as ApiResponse<{ items: any[] }>
+      if (json.ret_code !== 0) throw new Error(json.ret_msg || '加载失败')
+      const list = json.data?.items || []
+      const normalized: TimelineNewsItem[] = list.map((item: any) => {
+        const sentiment = normalizeSentiment(item.analysis?.sentiment || item.sentiment || 'neutral')
+        return {
+          ...item,
+          sentiment,
+          timestamp: parseNewsDate(item.publish_time || item.published_at || item.last_seen)
+        }
+      })
+      setItems(normalized)
+    } catch (err) {
+      setError((err as Error).message)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  useEffect(() => {
+    fetchList()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  useEffect(() => {
+    const loadWatchlist = async () => {
+      try {
+        const res = await fetch('/api/dashboard/sessions')
+        if (!res.ok) return
+        const json = await res.json()
+        const items = (json.sessions || []).map((s: any) => ({ code: s.code, nickname: s.nickname }))
+        setWatchlist(items)
+        if (!code && items.length) {
+          setCode(items[0].code)
+        }
+      } catch (err) {
+        console.warn('load watchlist failed', err)
+      }
+    }
+    loadWatchlist()
+  }, [])
+
+  const handleAnalyzeNow = async (item: TimelineNewsItem) => {
+    try {
+      const res = await fetch('/api/fundamental/analyze_now', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          code: item.code || code,
+          title: item.title,
+          url: item.url,
+          source: item.source,
+          snippet: item.snippet,
+          publish_time: item.publish_time || item.published_at
+        })
+      })
+      const json = (await res.json()) as ApiResponse<{ analysis?: any }>
+      if (!res.ok || json.ret_code !== 0) throw new Error(json.ret_msg || '触发分析失败')
+      await fetchList()
+      await fetchReports()
+    } catch (err) {
+      alert((err as Error).message)
+    }
+  }
+
+  const handleBatchAnalyze = async () => {
+    if (batchAnalyzing) return
+    const pendingItems = items.filter((item) => {
+      const providerKey = (item.analysis?.analysis_provider || '').toString().toLowerCase()
+      return providerKey === 'pending' || !item.analysis?.sentiment
+    })
+    if (!pendingItems.length) {
+      alert('没有待分析的资讯')
+      return
+    }
+    setBatchAnalyzing(true)
+    try {
+      for (const item of pendingItems) {
+        await handleAnalyzeNow(item)
+      }
+    } finally {
+      setBatchAnalyzing(false)
+    }
+  }
+
+  const fetchReports = async () => {
+    if (!code) return
+    setReportLoading(true)
+    try {
+      const res = await fetch('/api/fundamental/reports', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ code, limit: 20, offset: 0 })
+      })
+      const json = (await res.json()) as ApiResponse<{ items: any[] }>
+      if (res.ok && json.ret_code === 0) {
+        setReports(json.data?.items || [])
+      }
+    } catch (err) {
+      console.warn('load reports failed', err)
+    } finally {
+      setReportLoading(false)
+    }
+  }
+
+  useEffect(() => {
+    fetchReports()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [code])
+
+  const handleGenerateReport = async (period: 'daily' | 'weekly') => {
+    if (!code) {
+      alert('请先填写股票代码')
+      return
+    }
+    try {
+      setReportGenerating(period)
+      const res = await fetch('/api/fundamental/report', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          code,
+          stock_name: code,
+          period,
+          days: period === 'weekly' ? 7 : 3,
+          limit: 30,
+          source: 'manual'
+        })
+      })
+      const json = (await res.json()) as ApiResponse<{ report?: string }>
+      if (!res.ok || json.ret_code !== 0) throw new Error(json.ret_msg || '生成报告失败')
+      await fetchReports()
+      alert('报告已生成，可在列表查看')
+    } catch (err) {
+      alert((err as Error).message)
+    } finally {
+      setReportGenerating(null)
+    }
+  }
+
+  const handleAddWatch = () => {
+    const c = newWatchCode.trim().toUpperCase()
+    if (!c) return
+    if (!watchlist.find((w) => w.code.toUpperCase() === c)) {
+      setWatchlist((prev) => [...prev, { code: c }])
+    }
+    setCode(c)
+    setNewWatchCode('')
+  }
+
+  const handleSearchCustom = async () => {
+    const q = searchQuery.trim()
+    if (!q) {
+      alert('请输入搜索关键词')
+      return
+    }
+    setSearchStep('searching')
+    setSearchLoading(true)
+    try {
+      const res = await fetch('/api/fundamental/news/search_custom', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ q, size: 20 })
+      })
+      const json = await res.json()
+      if (!res.ok || json.ret_code !== 0) throw new Error(json.ret_msg || '搜索失败')
+      const items = json.data?.results || json.data?.items || json.data?.data?.results || []
+      setSearchResults(items)
+      setSearchStep('analyzing')
+      // 这里可以接后端分析/入库接口；暂用本地刷新兜底
+      await fetchList()
+      setSearchStep('storing')
+      setSearchStep('done')
+    } catch (err) {
+      alert((err as Error).message)
+      setSearchStep('idle')
+    } finally {
+      setSearchLoading(false)
+    }
+  }
+
+  return (
+    <div className="min-h-screen bg-slate-50">
+      <header className="bg-white border-b border-slate-200">
+        <div className="max-w-6xl mx-auto px-6 py-4 flex items-center gap-4">
+          <h1 className="text-2xl font-semibold text-slate-900">基础面中心</h1>
+          <a href="/" className="text-blue-600 text-sm hover:underline">
+            返回看板
+          </a>
+        </div>
+      </header>
+      <main className="max-w-6xl mx-auto px-6 py-6 space-y-4">
+        <div className="rounded-2xl bg-white border border-slate-200 p-4 flex flex-wrap gap-3 items-end">
+          <div>
+            <label className="text-xs text-slate-500">股票代码（关注/持仓）</label>
+            <select
+              className="mt-1 w-36 rounded border border-slate-200 px-2 py-1 text-sm"
+              value={code}
+              onChange={(e) => setCode(e.target.value)}
+            >
+              <option value="">请选择</option>
+              {watchlist.map((w) => (
+                <option key={w.code} value={w.code}>
+                  {w.code} {w.nickname ? `(${w.nickname})` : ''}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <label className="text-xs text-slate-500">状态</label>
+            <select
+              className="mt-1 rounded border border-slate-200 px-2 py-1 text-sm"
+              value={status}
+              onChange={(e) => setStatus(e.target.value as any)}
+            >
+              <option value="all">全部</option>
+              <option value="pending">待分析</option>
+              <option value="fail">分析失败</option>
+              <option value="done">已分析</option>
+            </select>
+          </div>
+          <div>
+            <label className="text-xs text-slate-500">起始日期</label>
+            <input
+              type="date"
+              className="mt-1 rounded border border-slate-200 px-2 py-1 text-sm"
+              value={startDate}
+              onChange={(e) => setStartDate(e.target.value)}
+            />
+          </div>
+          <div>
+            <label className="text-xs text-slate-500">结束日期</label>
+            <input
+              type="date"
+              className="mt-1 rounded border border-slate-200 px-2 py-1 text-sm"
+              value={endDate}
+              onChange={(e) => setEndDate(e.target.value)}
+            />
+          </div>
+          <div>
+            <label className="text-xs text-slate-500">数量</label>
+            <input
+              type="number"
+              className="mt-1 w-20 rounded border border-slate-200 px-2 py-1 text-sm"
+              value={limit}
+              min={1}
+              max={200}
+              onChange={(e) => setLimit(Number(e.target.value))}
+            />
+          </div>
+          <button
+            className="px-3 py-2 rounded-full border border-blue-200 text-blue-600 hover:bg-blue-50 text-sm"
+            onClick={fetchList}
+            disabled={loading}
+          >
+            {loading ? '加载中...' : '查询'}
+          </button>
+          <button
+            className="px-3 py-2 rounded-full border border-amber-200 text-amber-700 hover:bg-amber-50 text-sm"
+            onClick={handleBatchAnalyze}
+            disabled={batchAnalyzing || items.length === 0}
+            title="对当前列表中未分析/待分析的资讯批量触发LLM分析"
+          >
+            {batchAnalyzing ? '批量分析中...' : '批量触发分析'}
+          </button>
+          <div className="flex-1 min-w-[200px]">
+            <label className="text-xs text-slate-500">自定义新闻搜索</label>
+            <div className="mt-1 flex gap-2">
+              <input
+                className="flex-1 rounded border border-slate-200 px-2 py-1 text-sm"
+                placeholder="输入关键词，如 小米 汽车 基本面"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                onKeyDown={(e) => e.key === 'Enter' && handleSearchCustom()}
+              />
+              <button
+                className="px-3 py-2 rounded-full border border-emerald-200 text-emerald-600 hover:bg-emerald-50 text-sm"
+                onClick={handleSearchCustom}
+                disabled={searchLoading}
+              >
+                {searchLoading ? '搜索中...' : '搜索'}
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div className="grid gap-4 lg:grid-cols-[minmax(0,2fr)_minmax(260px,0.8fr)] items-start">
+          <div className="rounded-2xl bg-white border border-slate-200 p-4">
+            {error && <div className="text-sm text-rose-500 mb-3">{error}</div>}
+            {/* 自定义搜索进度 + 结果 */}
+            <div className="mb-4 rounded-xl border border-slate-200 bg-slate-50 p-3">
+              <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
+                <div className="text-sm font-semibold text-slate-900">自定义搜索/入库流程</div>
+                <div className="flex items-center gap-2 text-[11px] text-slate-500">
+                  {['searching', 'analyzing', 'storing', 'done'].map((s) => (
+                    <span
+                      key={s}
+                      className={`px-2 py-0.5 rounded-full border ${
+                        searchStep === s ? 'border-blue-200 bg-blue-50 text-blue-700' : 'border-slate-200 text-slate-400'
+                      }`}
+                    >
+                      {s === 'searching' && '搜索中'}
+                      {s === 'analyzing' && 'LLM分析'}
+                      {s === 'storing' && '写入入库'}
+                      {s === 'done' && '已完成'}
+                    </span>
+                  ))}
+                  {searchStep === 'idle' && <span className="px-2 py-0.5 text-slate-400">等待搜索</span>}
+                </div>
+              </div>
+              {searchResults.length > 0 ? (
+                <div className="space-y-2">
+                  {searchResults.map((r, idx) => (
+                    <div key={idx} className="rounded-xl border border-slate-200 bg-white p-3">
+                      <div className="flex items-start gap-2">
+                        <span className="text-[11px] text-slate-500 mt-0.5">{idx + 1}</span>
+                        <div className="space-y-1 min-w-0">
+                          <a
+                            className="text-sm font-semibold text-slate-900 hover:text-blue-600 line-clamp-2"
+                            href={r.url}
+                            target="_blank"
+                            rel="noreferrer"
+                          >
+                            {r.title || '未命名'}
+                          </a>
+                          <div className="flex flex-wrap items-center gap-2 text-[11px] text-slate-500">
+                            {r.publish_time && <span>{formatDateTime(r.publish_time)}</span>}
+                            {r.source && <span>{r.source}</span>}
+                          </div>
+                          {r.summary && <p className="text-xs text-slate-600 line-clamp-3">{r.summary}</p>}
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="text-xs text-slate-400">未开始或暂无搜索结果。输入关键词后点击右侧“搜索”。</div>
+              )}
+            </div>
+
+            {loading ? (
+              <div className="text-sm text-slate-500">加载中...</div>
+            ) : items.length === 0 ? (
+              <div className="text-sm text-slate-400">暂无数据</div>
+            ) : (
+              <div className="space-y-3">
+                {items.map((item, idx) => {
+                  const sentiment = item.sentiment || 'neutral'
+                  const sentimentKey = sentiment === 'bullish' || sentiment === 'bearish' ? sentiment : 'neutral'
+                  const style = sentimentStyles[sentimentKey] || sentimentStyles.neutral
+                  const providerKey = (item.analysis?.analysis_provider || '').toString().toLowerCase()
+                  const providerMeta = analysisProviderMeta[providerKey]
+                  const isPending = providerKey === 'pending' || (!item.analysis?.sentiment && !providerKey)
+                  const isFail = providerKey === 'fail'
+                  return (
+                    <div key={`${item.url}-${idx}`} className={`rounded-xl border p-3 ${style.border}`}>
+                      <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500">
+                        <span className={`px-2 py-0.5 rounded-full text-[11px] font-medium ${style.badge}`}>
+                          {sentimentKey === 'bullish' ? '利好' : sentimentKey === 'bearish' ? '利空' : '中性'}
+                        </span>
+                        <span>{formatDateTime(item.publish_time || item.published_at)}</span>
+                        {item.source && <span>{item.source}</span>}
+                        {providerMeta && <span className={`text-[11px] px-2 py-0.5 rounded-full ${providerMeta.className}`}>{providerMeta.label}</span>}
+                      </div>
+                      <div className="flex items-start gap-2">
+                        <a
+                          className="mt-2 block text-sm font-semibold text-slate-900 hover:text-blue-600"
+                          href={item.url}
+                          target="_blank"
+                          rel="noreferrer"
+                        >
+                          {item.title || '未命名资讯'}
+                        </a>
+                        {isPending && (
+                          <button
+                            className="ml-auto mt-2 text-[11px] px-2 py-1 rounded-full border border-blue-200 text-blue-600 hover:bg-blue-50"
+                            onClick={() => handleAnalyzeNow(item)}
+                          >
+                            触发分析
+                          </button>
+                        )}
+                        {isFail && (
+                          <button
+                            className="ml-auto mt-2 text-[11px] px-2 py-1 rounded-full border border-amber-200 text-amber-600 hover:bg-amber-50"
+                            onClick={() => handleAnalyzeNow(item)}
+                          >
+                            重试分析
+                          </button>
+                        )}
+                      </div>
+                      {item.analysis?.summary && <p className="text-xs text-slate-600 mt-1">{item.analysis.summary}</p>}
+                    </div>
+                  )
+                })}
+              </div>
+            )}
+          </div>
+
+
+          <aside className="rounded-2xl bg-white border border-slate-200 p-4 space-y-3">
+            <div className="flex items-center justify-between gap-2">
+              <div>
+                <h4 className="text-sm font-semibold text-slate-900">基础面报告</h4>
+                <p className="text-[11px] text-slate-500 mt-0.5">当前股票：{code || '未选择，请先输入并查询'}</p>
+              </div>
+              <div className="flex items-center gap-2 text-xs text-slate-500">
+                <button
+                  className="px-2 py-1 rounded-full border border-blue-200 text-blue-600 hover:bg-blue-50"
+                  onClick={() => handleGenerateReport('daily')}
+                  disabled={!code || reportGenerating === 'daily'}
+                >
+                  {reportGenerating === 'daily' ? '生成中...' : '生成日报'}
+                </button>
+                <button
+                  className="px-2 py-1 rounded-full border border-blue-200 text-blue-600 hover:bg-blue-50"
+                  onClick={() => handleGenerateReport('weekly')}
+                  disabled={!code || reportGenerating === 'weekly'}
+                >
+                  {reportGenerating === 'weekly' ? '生成中...' : '生成周报'}
+                </button>
+              </div>
+            </div>
+            {reportLoading ? <div className="text-xs text-slate-500">加载报告中...</div> : null}
+            {reports.length === 0 ? (
+              <div className="text-xs text-slate-400">{code ? '暂无报告，先点击生成日报/周报' : '请先输入股票代码并查询后再生成报告'}</div>
+            ) : (
+              <div className="space-y-2 max-h-[420px] overflow-y-auto pr-1">
+                {reports.map((item) => (
+                  <a
+                    key={item.id}
+                    className="w-full block text-left rounded-xl border border-slate-200 p-3 hover:border-blue-200"
+                    href={`/fundamental-report?id=${item.id}`}
+                    onClick={(e) => {
+                      if (navigateTo) {
+                        e.preventDefault()
+                        navigateTo(`/fundamental-report?id=${item.id}`)
+                      }
+                    }}
+                  >
+                    <div className="flex items-center justify-between text-xs text-slate-500">
+                      <div className="font-semibold text-slate-900 truncate mr-2">{item.title || `${item.code} ${item.date}`}</div>
+                      <span>{item.date}</span>
+                    </div>
+                    <p className="text-[11px] text-slate-500 mt-1 line-clamp-3">{item.report}</p>
+                  </a>
+                ))}
+              </div>
+            )}
+            <div className="pt-3 border-t border-slate-100 space-y-2">
+              <div className="flex items-center justify-between">
+                <h5 className="text-xs font-semibold text-slate-800">关注/持仓列表</h5>
+                <span className="text-[11px] text-slate-400">点击切换</span>
+              </div>
+              <div className="flex gap-2">
+                <input
+                  className="flex-1 rounded border border-slate-200 px-2 py-1 text-xs"
+                  placeholder="输入代码关注，如 HK.01810"
+                  value={newWatchCode}
+                  onChange={(e) => setNewWatchCode(e.target.value)}
+                  onKeyDown={(e) => e.key === 'Enter' && handleAddWatch()}
+                />
+                <button
+                  className="px-2 py-1 rounded border border-blue-200 text-blue-600 text-xs hover:bg-blue-50"
+                  onClick={handleAddWatch}
+                >
+                  关注
+                </button>
+              </div>
+              <div className="space-y-1 max-h-[180px] overflow-y-auto">
+                {watchlist.length === 0 ? (
+                  <div className="text-[11px] text-slate-400">暂无关注/持仓，右侧输入添加</div>
+                ) : (
+                  watchlist.map((w) => (
+                    <button
+                      key={w.code}
+                      className={`w-full flex items-center justify-between rounded-lg border px-2 py-1 text-xs ${
+                        code === w.code ? 'border-blue-200 bg-blue-50 text-blue-700' : 'border-slate-200 hover:border-slate-300'
+                      }`}
+                      onClick={() => setCode(w.code)}
+                    >
+                      <span className="font-semibold truncate">{w.code}</span>
+                      {w.nickname && <span className="text-[11px] text-slate-500 ml-2 truncate">{w.nickname}</span>}
+                    </button>
+                  ))
+                )}
+              </div>
+            </div>
+          </aside>
+        </div>
+      </main>
+      {selectedReport && (
+        <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center px-4">
+          <div className="bg-white rounded-2xl shadow-2xl max-w-3xl w-full max-h-[80vh] overflow-hidden">
+            <div className="flex items-center justify-between border-b border-slate-200 px-4 py-3">
+              <div>
+                <div className="text-sm font-semibold text-slate-900">{selectedReport.title || `${selectedReport.code} ${selectedReport.date}`}</div>
+                <div className="text-[11px] text-slate-500">
+                  {selectedReport.date} · {selectedReport.period || 'daily'} · {selectedReport.items_used ? `引用 ${selectedReport.items_used} 条` : ''}
+                </div>
+              </div>
+              <button
+                className="text-slate-500 hover:text-slate-800 text-sm px-2 py-1"
+                onClick={() => setSelectedReport(null)}
+              >
+                关闭
+              </button>
+            </div>
+            <div className="p-4 overflow-y-auto max-h-[70vh]">
+              <p className="text-sm leading-6 whitespace-pre-wrap text-slate-800">{selectedReport.report}</p>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ===== 基础面报告详情页 =====
+type ChatMessage = { role: 'user' | 'assistant'; content: string; kind?: 'report' }
+
+function FundamentalReportPage() {
+  const params = new URLSearchParams(window.location.search)
+  const reportId = Number(params.get('id') || 0)
+  const [report, setReport] = useState<any | null>(null)
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [chatLog, setChatLog] = useState<ChatMessage[]>([])
+  const [question, setQuestion] = useState('')
+  const [chatting, setChatting] = useState(false)
+  const [copyTip, setCopyTip] = useState<string | null>(null)
+  const [selectedRefIds, setSelectedRefIds] = useState<Set<string>>(new Set())
+
+  useEffect(() => {
+    const fetchReport = async () => {
+      if (!reportId) {
+        setError('缺少报告ID')
+        return
+      }
+      setLoading(true)
+      setError(null)
+      try {
+        const res = await fetch(`/api/fundamental/report/${reportId}`)
+        const json = (await res.json()) as ApiResponse<{ report: any }>
+        if (!res.ok || json.ret_code !== 0) throw new Error(json.ret_msg || '加载失败')
+        setReport(json.data?.report || null)
+      } catch (err) {
+        setError((err as Error).message)
+      } finally {
+        setLoading(false)
+      }
+    }
+    fetchReport()
+  }, [reportId])
+
+  const handleAsk = async () => {
+    if (!question.trim() || !reportId) return
+    const q = question.trim()
+    setChatLog((prev) => [...prev, { role: 'user', content: q }])
+    setQuestion('')
+    setChatting(true)
+    const refIds = Array.from(selectedRefIds).filter(Boolean)
+    try {
+      const res = await fetch('/api/fundamental/report/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ report_id: reportId, question: q, ref_ids: refIds })
+      })
+      const json = (await res.json()) as ApiResponse<{ answer: string }>
+      if (!res.ok || json.ret_code !== 0) throw new Error(json.ret_msg || '提问失败')
+      setChatLog((prev) => [...prev, { role: 'assistant', content: json.data?.answer || '' }])
+    } catch (err) {
+      setChatLog((prev) => [...prev, { role: 'assistant', content: `提问失败: ${(err as Error).message}` }])
+    } finally {
+      setChatting(false)
+    }
+  }
+
+  const backUrl = '/fundamental'
+
+  const combinedMessages = useMemo(() => {
+    const arr: ChatMessage[] = []
+    if (report) {
+      arr.push({ role: 'assistant', content: report.report || '暂无报告内容', kind: 'report' })
+    }
+    return [...arr, ...chatLog]
+  }, [report, chatLog])
+
+  const references = useMemo(() => {
+    return ((report?.meta?.references || []) as any[]).filter(Boolean)
+  }, [report])
+
+  useEffect(() => {
+    if (!references.length) {
+      setSelectedRefIds(new Set())
+      return
+    }
+    const defaults = references.slice(0, 3).map((r) => String(r.ref_id || r.unique_key || r.id || ''))
+    setSelectedRefIds(new Set(defaults))
+  }, [references])
+
+  const copyReport = async () => {
+    if (!report?.report) return
+    try {
+      await navigator.clipboard.writeText(report.report)
+      setCopyTip('已复制')
+      setTimeout(() => setCopyTip(null), 1800)
+    } catch (err) {
+      setCopyTip('复制失败')
+      setTimeout(() => setCopyTip(null), 1800)
+    }
+  }
+
+  if (!reportId) {
+    return (
+      <div className="min-h-screen bg-slate-50 flex items-center justify-center text-slate-500">
+        缺少报告ID，<a className="text-blue-600 ml-2" href={backUrl}>返回基础面中心</a>
+      </div>
+    )
+  }
+
+  return (
+    <div className="min-h-screen bg-slate-50 flex flex-col">
+      <header className="bg-white border-b border-slate-200 sticky top-0 z-20">
+        <div className="max-w-5xl mx-auto px-4 sm:px-6 py-3 flex items-center justify-between gap-3">
+          <div className="flex items-center gap-3">
+            <a href={backUrl} className="text-blue-600 text-sm hover:underline">
+              返回基础面中心
+            </a>
+            <h1 className="text-xl sm:text-2xl font-semibold text-slate-900">基础面报告</h1>
+          </div>
+          {report && (
+            <div className="flex items-center gap-2 text-[11px] text-slate-500">
+              <span className="px-2 py-0.5 rounded-full border border-slate-200 bg-slate-50">{report.code}</span>
+              {report.stock_name && <span className="px-2 py-0.5 rounded-full border border-slate-200 bg-slate-50">{report.stock_name}</span>}
+              <span className="px-2 py-0.5 rounded-full border border-blue-100 bg-blue-50 text-blue-700">{report.period || 'daily'}</span>
+              <span className="px-2 py-0.5 rounded-full border border-slate-200 bg-slate-50">{report.date}</span>
+            </div>
+          )}
+        </div>
+      </header>
+      <main className="flex-1">
+        {loading ? (
+          <div className="max-w-3xl mx-auto px-4 py-8 text-slate-500 text-sm">加载中...</div>
+        ) : error ? (
+          <div className="max-w-3xl mx-auto px-4 py-8 text-rose-500 text-sm">{error}</div>
+        ) : !report ? (
+          <div className="max-w-3xl mx-auto px-4 py-8 text-slate-500 text-sm">未找到报告</div>
+        ) : (
+          <div className="max-w-5xl mx-auto px-4 sm:px-6 py-6">
+            <div className="rounded-2xl border border-slate-200 bg-white p-4 sm:p-6 shadow-sm">
+              <div className="flex flex-wrap items-center justify-between gap-3 pb-3 border-b border-slate-100">
+                <div className="space-y-1">
+                  <div className="text-lg font-semibold text-slate-900">{report.title || `${report.code} ${report.date}`}</div>
+                  <div className="text-xs text-slate-500 flex flex-wrap items-center gap-2">
+                    <span className="px-2 py-0.5 rounded-full border border-slate-200 bg-slate-50">{report.code}</span>
+                    {report.stock_name && <span className="px-2 py-0.5 rounded-full border border-slate-200 bg-slate-50">{report.stock_name}</span>}
+                    <span className="px-2 py-0.5 rounded-full border border-blue-100 bg-blue-50 text-blue-700">{report.period || 'daily'}</span>
+                    <span className="px-2 py-0.5 rounded-full border border-slate-200 bg-slate-50">{report.date}</span>
+                    <span className="px-2 py-0.5 rounded-full border border-slate-200 bg-slate-50">引用 {report.items_used ?? '--'} 条</span>
+                    {report.days ? <span className="px-2 py-0.5 rounded-full border border-slate-200 bg-slate-50">拉取 {report.days} 天</span> : null}
+                    {report.size_limit ? <span className="px-2 py-0.5 rounded-full border border-slate-200 bg-slate-50">上限 {report.size_limit} 条</span> : null}
+                    {report.source ? <span className="px-2 py-0.5 rounded-full border border-slate-200 bg-slate-50">来源 {report.source}</span> : null}
+                    {report.created_at ? <span className="px-2 py-0.5 rounded-full border border-slate-200 bg-slate-50">{report.created_at.slice(0, 19).replace('T', ' ')}</span> : null}
+                  </div>
+                </div>
+                <div className="flex items-center gap-2 text-xs text-slate-500">
+                  <button
+                    className="px-3 py-1.5 rounded-full border border-slate-200 hover:bg-slate-50"
+                    onClick={copyReport}
+                  >
+                    复制全文
+                  </button>
+                  <a
+                    className="px-3 py-1.5 rounded-full border border-blue-200 text-blue-600 hover:bg-blue-50"
+                    href={backUrl}
+                  >
+                    返回
+                  </a>
+                </div>
+              </div>
+
+              {copyTip && <div className="text-xs text-blue-600 mt-2">{copyTip}</div>}
+
+              <div className="mt-4 rounded-xl border border-slate-200 bg-slate-50 p-3 space-y-2">
+                <div className="flex items-center justify-between">
+                  <div className="text-sm font-semibold text-slate-900">引用点（可加入对话上下文）</div>
+                  <div className="flex items-center gap-2 text-[11px] text-slate-500">
+                    <span>{selectedRefIds.size}/{references.length} 已选</span>
+                    <button
+                      className="px-2 py-1 rounded-full border border-slate-200 hover:bg-slate-100"
+                      onClick={() => {
+                        if (!references.length) return
+                        if (selectedRefIds.size === references.length) {
+                          setSelectedRefIds(new Set())
+                        } else {
+                          setSelectedRefIds(new Set(references.map((r) => String(r.ref_id || r.unique_key || r.id || ''))))
+                        }
+                      }}
+                    >
+                      {references.length && selectedRefIds.size === references.length ? '清空' : '全选'}
+                    </button>
+                  </div>
+                </div>
+                {references.length === 0 ? (
+                  <div className="text-[12px] text-slate-500">报告未记录引用点，或生成时未保存引用。</div>
+                ) : (
+                  <div className="space-y-2 max-h-[260px] overflow-y-auto pr-1">
+                    {references.map((ref, idx) => {
+                      const refId = String(ref.ref_id || ref.unique_key || ref.id || idx)
+                      const checked = selectedRefIds.has(refId)
+                      return (
+                        <label
+                          key={refId}
+                          className={`block rounded-xl border px-3 py-2 text-xs space-y-1 cursor-pointer ${
+                            checked ? 'border-blue-200 bg-white' : 'border-slate-200 bg-white'
+                          }`}
+                        >
+                          <div className="flex items-start gap-2">
+                            <input
+                              type="checkbox"
+                              className="mt-0.5"
+                              checked={checked}
+                              onChange={(e) => {
+                                setSelectedRefIds((prev) => {
+                                  const next = new Set(prev)
+                                  if (e.target.checked) next.add(refId)
+                                  else next.delete(refId)
+                                  return next
+                                })
+                              }}
+                            />
+                            <div className="min-w-0">
+                              <div className="font-semibold text-slate-900 truncate">{ref.title || '未命名资讯'}</div>
+                              <div className="flex flex-wrap items-center gap-2 text-[11px] text-slate-500">
+                                {ref.publish_time && <span>{formatDateTime(ref.publish_time)}</span>}
+                                {ref.source && <span>{ref.source}</span>}
+                                {ref.sentiment && <span className="px-2 py-0.5 rounded-full border border-slate-200">{ref.sentiment}</span>}
+                              </div>
+                              {ref.summary && <p className="text-[12px] text-slate-600 line-clamp-2">{ref.summary}</p>}
+                            </div>
+                          </div>
+                        </label>
+                      )
+                    })}
+                  </div>
+                )}
+              </div>
+
+              <div className="mt-4 space-y-4">
+                {combinedMessages.map((msg, idx) => {
+                  const isUser = msg.role === 'user'
+                  const isReport = msg.kind === 'report'
+                  return (
+                    <div key={idx} className={`flex ${isUser ? 'justify-end' : 'justify-start'}`}>
+                      <div
+                    className={`max-w-[90%] sm:max-w-[80%] rounded-2xl px-4 py-3 text-sm leading-6 border ${
+                      isUser
+                        ? 'bg-blue-50 text-slate-800 border-blue-100'
+                        : isReport
+                        ? 'bg-slate-50 text-slate-800 border-slate-200'
+                        : 'bg-white text-slate-800 border-slate-200'
+                    }`}
+                  >
+                    <div className="text-[11px] text-slate-500 mb-1">{isUser ? '你' : isReport ? '报告' : 'LLM'}</div>
+                    <div className="space-y-1">{renderMarkdown(msg.content)}</div>
+                    {isReport && (
+                      <div className="mt-2 text-[11px] text-slate-500">
+                        以上为报告全文，可直接追问：风险？催化剂？整体情绪？
+                      </div>
+                    )}
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+
+              <div className="mt-6 space-y-2">
+                <textarea
+                  className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm"
+                  rows={3}
+                  placeholder="就这份报告追问：风险？催化剂？整体情绪？"
+                  value={question}
+                  onChange={(e) => setQuestion(e.target.value)}
+                />
+                <div className="flex flex-wrap gap-2 text-[11px] text-slate-500">
+                  <button
+                    type="button"
+                    className="px-2 py-1 rounded-full border border-slate-200 hover:bg-slate-50"
+                    onClick={() => setQuestion('这份报告的核心风险和催化剂是什么？')}
+                  >
+                    风险/催化剂
+                  </button>
+                  <button
+                    type="button"
+                    className="px-2 py-1 rounded-full border border-slate-200 hover:bg-slate-50"
+                    onClick={() => setQuestion('整体情绪和关键逻辑是什么？')}
+                  >
+                    情绪/逻辑
+                  </button>
+                  <button
+                    type="button"
+                    className="px-2 py-1 rounded-full border border-slate-200 hover:bg-slate-50"
+                    onClick={() => setQuestion('未来一周的潜在催化剂和关注点有哪些？')}
+                  >
+                    未来催化剂
+                  </button>
+                </div>
+                <button
+                  className="w-full px-3 py-2 rounded-full border border-blue-200 text-blue-600 hover:bg-blue-50 text-sm disabled:opacity-60"
+                  onClick={handleAsk}
+                  disabled={chatting || !question.trim()}
+                >
+                  {chatting ? '提问中...' : '发送'}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+      </main>
+    </div>
+  )
+}
 export default function App() {
+  const [appPath, setAppPath] = useState(() =>
+    typeof window !== 'undefined' ? window.location.pathname : '/'
+  )
+  const [appSearch, setAppSearch] = useState(() =>
+    typeof window !== 'undefined' ? window.location.search : ''
+  )
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    const handler = () => {
+      setAppPath(window.location.pathname)
+      setAppSearch(window.location.search)
+    }
+    window.addEventListener('popstate', handler)
+    return () => window.removeEventListener('popstate', handler)
+  }, [])
+  const navigateTo = (url: string) => {
+    if (typeof window === 'undefined') return
+    window.history.pushState({}, '', url)
+    setAppPath(window.location.pathname)
+    setAppSearch(window.location.search)
+  }
+
+  if (typeof window !== 'undefined' && appPath.startsWith('/fundamental-report')) {
+    return <FundamentalReportPage />
+  }
+  if (typeof window !== 'undefined' && appPath.includes('/fundamental')) {
+    return <FundamentalCenter navigateTo={navigateTo} />
+  }
   const [sessions, setSessions] = useState<SessionItem[]>([])
   const [quota, setQuota] = useState<QuotaInfo | null>(null)
   const [listLoading, setListLoading] = useState(true)
@@ -1021,6 +2026,36 @@ export default function App() {
     () => mergeKlineSeries(normalizedHistory, streamKlines),
     [normalizedHistory, streamKlines]
   )
+  const triggerAnalyzeNow = async (item: TimelineNewsItem) => {
+    try {
+      const res = await fetch('/api/fundamental/analyze_now', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          code: data?.code,
+          title: item.title,
+          url: item.url,
+          source: item.source,
+          snippet: item.snippet,
+          publish_time: item.publish_time || item.published_at
+        })
+      })
+      if (!res.ok) {
+        const text = await res.text()
+        throw new Error(text || '触发分析失败')
+      }
+      const json = (await res.json()) as ApiResponse<{ analysis?: any }>
+      if (json.ret_code !== 0) {
+        throw new Error(json.ret_msg || '触发分析失败')
+      }
+      // 触发成功后，重载 signals 模块以获取最新
+      if (selectedSession) {
+        handleReloadModule('signals')
+      }
+    } catch (err) {
+      alert((err as Error).message)
+    }
+  }
   const sessionKlinePoints = useMemo(() => {
     if (!mergedKlinePoints.length) return []
     const last = mergedKlinePoints[mergedKlinePoints.length - 1]
@@ -1052,6 +2087,7 @@ export default function App() {
       onBack={() => setSelectedSession(null)}
       onRefresh={() => selectedSession && loadDetail(selectedSession, { preserve: true })}
       onReloadModule={handleReloadModule}
+      onAnalyzeNow={(item) => triggerAnalyzeNow(item)}
       onUpdateSignals={(signals) =>
         setData((prev) =>
           prev
@@ -1094,6 +2130,12 @@ export default function App() {
               {quotaText} · {usagePercent}%
             </span>
             <div className="ml-auto flex gap-3">
+              <a
+                href="/fundamental"
+                className="px-4 py-2 rounded-full bg-blue-600 text-white hover:bg-blue-500"
+              >
+                基础面中心
+              </a>
               <button className="px-4 py-2 rounded-full border border-slate-200 text-slate-600 bg-white hover:bg-slate-100">关注</button>
               <button className="px-4 py-2 rounded-full border border-slate-200 text-slate-600 bg-white hover:bg-slate-100">分享</button>
             </div>
@@ -1261,6 +2303,8 @@ type DetailContentProps = {
   onRefresh: () => void
   onUpdateSignals?: (signals: SignalMap) => void
   onReloadModule?: (module: DashboardModule) => void
+  onAnalyzeNow?: (item: TimelineNewsItem) => void
+  onNavigate?: (url: string) => void
 }
 
 function DetailContent({
@@ -1276,9 +2320,11 @@ function DetailContent({
   onBack,
   onRefresh,
   onUpdateSignals,
-  onReloadModule
+  onReloadModule,
+  onAnalyzeNow,
+  onNavigate
 }: DetailContentProps) {
-  const quote = liveQuote ?? data.quote
+const quote = liveQuote ?? data.quote
   const sessionMeta = data.session
   const sessionWindow = data.session_window
   const signalModuleState = moduleStatus.signals
@@ -1310,6 +2356,7 @@ function DetailContent({
   const [newsSize, setNewsSize] = useState(10)
   const [newsDays, setNewsDays] = useState(3)
   const [newsRefreshing, setNewsRefreshing] = useState(false)
+  const [reportGenerating, setReportGenerating] = useState<null | 'daily' | 'weekly'>(null)
   const [strategyPageId, setStrategyPageId] = useState<string | null>(() => {
     const params = new URLSearchParams(window.location.search)
     return params.get('strategy')
@@ -1320,6 +2367,8 @@ function DetailContent({
   const [priceDelta, setPriceDelta] = useState<number | null>(null)
   const [pricePulseToken, setPricePulseToken] = useState(0)
   const [pricePulse, setPricePulse] = useState(false)
+  const [latestReports, setLatestReports] = useState<any[]>([])
+  const [reportListLoading, setReportListLoading] = useState(false)
   useEffect(() => {
     setAnalysisResult(null)
     setAnalysisQuestion('')
@@ -1329,6 +2378,7 @@ function DetailContent({
     setRecommendations(data.recommendations ?? [])
     setAnalysisContextSnapshot(null)
     setPrefetchedStrategy(null)
+    setLatestReports([])
   }, [data.code])
   useEffect(() => {
     setRecommendations(data.recommendations ?? [])
@@ -1382,6 +2432,29 @@ function DetailContent({
     const timer = window.setTimeout(() => setPricePulse(false), 700)
     return () => window.clearTimeout(timer)
   }, [pricePulseToken])
+
+  useEffect(() => {
+    const fetchReports = async () => {
+      if (!data.code) return
+      setReportListLoading(true)
+      try {
+        const res = await fetch('/api/fundamental/reports', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ code: data.code, limit: 5, offset: 0 })
+        })
+        const json = await res.json()
+        if (res.ok && json.ret_code === 0) {
+          setLatestReports(json.data?.items || [])
+        }
+      } catch (err) {
+        console.warn('load latest reports failed', err)
+      } finally {
+        setReportListLoading(false)
+      }
+    }
+    fetchReports()
+  }, [data.code])
 
   if (strategyPageId) {
     return (
@@ -1477,6 +2550,8 @@ function DetailContent({
         .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0)),
     [bullishNews, bearishNews, neutralNews]
   )
+  const signalsSummary = useMemo(() => (data.signals as any)?.summary, [data.signals])
+  const signalsMeta = useMemo(() => (data.signals as any)?.meta, [data.signals])
   const computedDailyMetrics = useMemo(() => {
     const computed = computeDailyMetricsFromNews(timelineNews)
     if (computed.length) {
@@ -1528,6 +2603,7 @@ const timelineGroups = useMemo<TimelineGroup[]>(() => {
       })
       .map(({ latestTs, ...group }) => group)
 }, [timelineNews, dailyMetricMap])
+
   const filteredTimelineGroups = useMemo(() => {
     if (sentimentFilter === 'all') {
       return timelineGroups
@@ -1571,33 +2647,19 @@ const timelineGroups = useMemo<TimelineGroup[]>(() => {
     }
   ]
   const newsSizeOptions = useMemo(() => Array.from({ length: 10 }, (_, idx) => (idx + 1) * 10), [])
-  const newsDaysOptions = useMemo(() => [3, 7, 14, 30], [])
-  const sentimentStyles = {
-    bullish: {
-      dot: 'bg-emerald-500',
-      badge: 'bg-emerald-50 text-emerald-600',
-      border: 'hover:border-emerald-200/80'
-    },
-    bearish: {
-      dot: 'bg-rose-500',
-      badge: 'bg-rose-50 text-rose-500',
-      border: 'hover:border-rose-200/80'
-    },
-    neutral: {
-      dot: 'bg-slate-400',
-      badge: 'bg-slate-100 text-slate-500',
-      border: 'hover:border-slate-200'
-    }
-  } as const
+  const newsDaysOptions = useMemo(() => [1, 2, 3, 7, 14, 30], [])
+  const pendingCount = useMemo(
+    () =>
+      timelineNews.filter(
+        (item) => !item.analysis?.sentiment || (item.analysis?.analysis_provider || '').toString().toLowerCase() === 'pending'
+      ).length,
+    [timelineNews]
+  )
   const llmModelOptions = [
     { key: 'deepseek', label: 'DeepSeek' },
     { key: 'kimi', label: 'Kimi' },
     { key: 'gemini', label: 'Gemini' }
   ]
-  const analysisProviderMeta: Record<string, { label: string; className: string }> = {
-    deepseek: { label: 'LLM分析', className: 'bg-blue-50 text-blue-600 border border-blue-100' },
-    fallback: { label: '关键词兜底', className: 'bg-amber-50 text-amber-700 border border-amber-100' }
-  }
   const shouldShowAnalysisPanel =
     analysisLoading || !!analysisResult || Object.keys(analysisModelStates).length > 0
   const analysisStartTime = analysisResult?.started_at || analysisWindow?.start
@@ -1767,7 +2829,12 @@ const timelineGroups = useMemo<TimelineGroup[]>(() => {
       const res = await fetch('/api/fundamental/news/refresh', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ code: data.code, size: newsSize, days: newsDays })
+        body: JSON.stringify({
+          code: data.code,
+          size: newsSize,
+          days: newsDays,
+          stock_name: data.quote?.name || data.session?.nickname
+        })
       })
       if (!res.ok) {
         const text = await res.text()
@@ -1788,6 +2855,31 @@ const timelineGroups = useMemo<TimelineGroup[]>(() => {
       if (!silent) {
         setNewsRefreshing(false)
       }
+    }
+  }
+
+  const handleGenerateReport = async (period: 'daily' | 'weekly') => {
+    setReportGenerating(period)
+    try {
+      const res = await fetch('/api/fundamental/report', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          code: data.code,
+          stock_name: data.quote?.name || data.session?.nickname,
+          period,
+          days: period === 'weekly' ? 7 : newsDays || 3,
+          limit: newsSize || 20,
+          source: 'dashboard'
+        })
+      })
+      const json = (await res.json()) as ApiResponse<{ report?: string }>
+      if (!res.ok || json.ret_code !== 0) throw new Error(json.ret_msg || '生成报告失败')
+      alert('报告已生成，可在基础面中心查看')
+    } catch (err) {
+      alert((err as Error).message)
+    } finally {
+      setReportGenerating(null)
     }
   }
 
@@ -2012,106 +3104,172 @@ const timelineGroups = useMemo<TimelineGroup[]>(() => {
         ))}
       </div>
 
-      <div className="grid gap-6 lg:grid-cols-[2fr_1fr] items-start">
-        <section className="rounded-3xl border border-slate-100 bg-white p-6 flex flex-col h-full">
+      <div className="grid gap-6 lg:grid-cols-[minmax(0,1.55fr)_minmax(320px,0.95fr)] items-start">
+        <section className="rounded-3xl border border-slate-100 bg-white p-6 flex flex-col h-full min-w-0 space-y-4">
           <div className="flex flex-wrap items-start justify-between gap-4">
-            <div>
-              <h3 className="text-lg font-semibold text-slate-900">资讯时间轴</h3>
-              <p className="text-xs text-slate-400">基于 Metaso 搜索的实时资讯</p>
-              {computedDailyMetrics.length > 0 && (
-                <div className="mt-3 grid gap-2 text-[11px] sm:grid-cols-2 lg:grid-cols-3">
-                  {computedDailyMetrics.slice(0, 3).map((metric) => {
-                    const weighted = metric.weighted_score ?? metric.score
-                    const tone = weighted >= 0 ? 'text-emerald-600' : 'text-rose-500'
-                    return (
-                      <div key={metric.date} className="rounded-2xl border border-slate-100 bg-slate-50 px-3 py-2">
-                        <div className="font-medium text-slate-600">{metric.date}</div>
-                        <div className={`mt-1 font-semibold ${tone}`}>
-                          情绪 {weighted >= 0 ? '+' : ''}{(weighted * 100).toFixed(0)}%
-                        </div>
-                        <p className="text-[11px] text-slate-400 mt-1">利好 {metric.bullish} · 利空 {metric.bearish} · 中性 {metric.neutral}</p>
+            <div className="space-y-1">
+              <div className="text-sm font-semibold text-slate-900">基础面模块</div>
+              <p className="text-xs text-slate-400">本地缓存 + 拉新，一站式查看与汇总</p>
+            </div>
+            <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500">
+              <button
+                type="button"
+                onClick={() => onReloadModule?.('signals')}
+                disabled={signalModuleState.loading}
+                className="px-3 py-1.5 rounded-full border border-slate-200 text-slate-600 hover:bg-slate-50 disabled:opacity-50"
+                title="仅重载本地缓存，不访问外部搜索"
+              >
+                重载缓存
+              </button>
+              <button
+                type="button"
+                onClick={() => handleRefreshNews()}
+                disabled={newsRefreshing}
+                className="px-3 py-1.5 rounded-full border border-blue-200 text-blue-600 hover:bg-blue-50 disabled:opacity-50"
+              >
+                {newsRefreshing ? '刷新中...' : '刷新基本面'}
+              </button>
+              <button
+                type="button"
+                onClick={() => handleGenerateReport('daily')}
+                disabled={!!reportGenerating}
+                className="px-3 py-1.5 rounded-full border border-emerald-200 text-emerald-600 hover:bg-emerald-50 disabled:opacity-50"
+              >
+                {reportGenerating === 'daily' ? '生成中...' : '生成日报'}
+              </button>
+              <button
+                type="button"
+                onClick={() => handleGenerateReport('weekly')}
+                disabled={!!reportGenerating}
+                className="px-3 py-1.5 rounded-full border border-emerald-200 text-emerald-600 hover:bg-emerald-50 disabled:opacity-50"
+              >
+                {reportGenerating === 'weekly' ? '生成中...' : '生成周报'}
+              </button>
+              <a
+                className="px-3 py-1.5 rounded-full border border-slate-200 text-slate-600 hover:bg-slate-50"
+                href={`/fundamental?code=${data.code}`}
+              >
+                基础面中心
+              </a>
+            </div>
+          </div>
+
+          <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+            <div className="rounded-2xl border border-slate-100 bg-slate-50 px-3 py-3">
+              <div className="text-[11px] text-slate-500">基础面汇总</div>
+              {signalsSummary?.headlines?.length ? (
+                <>
+                  <div className="mt-1 text-sm font-semibold text-slate-900 flex items-center gap-3">
+                    <span>利好 {signalsSummary.counts?.bullish ?? 0}</span>
+                    <span>利空 {signalsSummary.counts?.bearish ?? 0}</span>
+                    <span>中性 {signalsSummary.counts?.neutral ?? 0}</span>
+                  </div>
+                  <div className="mt-2 space-y-1 text-[11px] text-slate-600">
+                    {signalsSummary.headlines.slice(0, 3).map((h: any, idx: number) => (
+                      <div key={idx} className="truncate">
+                        <span className="font-semibold mr-1">
+                          {h.sentiment === 'bullish' ? '利好' : h.sentiment === 'bearish' ? '利空' : '中性'}
+                        </span>
+                        <a className="hover:text-blue-600" href={h.url} target="_blank" rel="noreferrer">
+                          {h.title}
+                        </a>
                       </div>
-                    )
-                  })}
-                </div>
+                    ))}
+                  </div>
+                </>
+              ) : (
+                <div className="mt-2 text-[11px] text-slate-400">暂无汇总，点击刷新获取</div>
               )}
             </div>
-            <div className="flex flex-wrap gap-3 items-center">
-              {sentimentOptions.map((option) => {
-                const isActive = sentimentFilter === option.key
-                return (
-                  <button
-                    key={option.key}
-                    type="button"
-                    onClick={() => setSentimentFilter(option.key)}
-                    className={`px-3 py-1.5 text-xs rounded-full border transition ${isActive ? option.activeClass : option.baseClass}`}
-                  >
-                    {option.label}
-                    <span className="ml-1 text-[11px] opacity-70">{option.count}</span>
-                  </button>
-                )
-              })}
-              <span className="text-xs text-slate-400">共 {displayedTimelineCount} 条</span>
-              <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500 ml-auto">
-                <label htmlFor="news-days" className="text-slate-500">
-                  刷新时间范围（仅用于拉新）：
-                </label>
-                <select
-                  id="news-days"
-                  className="rounded-full border border-slate-200 px-2 py-1 text-slate-700"
-                  value={newsDays}
-                  onChange={(e) => setNewsDays(Number(e.target.value))}
-                >
-                  {newsDaysOptions.map((d) => (
-                    <option key={d} value={d}>
-                      最近 {d} 天
-                    </option>
-                  ))}
-                </select>
-                <span className="text-[11px] text-slate-400">默认展示本地缓存，可重载缓存或点击刷新获取最新</span>
-                <label htmlFor="news-size" className="text-slate-500">
-                  每次拉取：
-                </label>
-                <select
-                  id="news-size"
-                  className="rounded-full border border-slate-200 px-2 py-1 text-slate-700"
-                  value={newsSize}
-                  onChange={(e) => setNewsSize(Number(e.target.value))}
-                >
-                  {newsSizeOptions.map((size) => (
-                    <option key={size} value={size}>
-                      {size} 条
-                    </option>
-                  ))}
-                </select>
-                <button
-                  type="button"
-                  onClick={() => onReloadModule?.('signals')}
-                  disabled={signalModuleState.loading}
-                  className="px-3 py-1.5 rounded-full border border-slate-200 text-slate-600 hover:bg-slate-50 disabled:opacity-50"
-                  title="仅重载本地缓存，不访问外部搜索"
-                >
-                  重载缓存
-                </button>
-                <button
-                  type="button"
-                  onClick={() => handleRefreshNews()}
-                  disabled={newsRefreshing}
-                  className="px-3 py-1.5 rounded-full border border-blue-200 text-blue-600 hover:bg-blue-50 disabled:opacity-50"
-                >
-                  {newsRefreshing ? '刷新中...' : '刷新基本面'}
-                </button>
-                {signalModuleState.loading && timelineNews.length > 0 && <span className="text-amber-600">更新中...</span>}
-                {signalModuleState.error && timelineNews.length > 0 && (
-                  <button type="button" onClick={() => onReloadModule?.('signals')} className="text-rose-500 hover:underline">
-                    重新加载
-                  </button>
-                )}
+            <div className="rounded-2xl border border-slate-100 bg-white px-3 py-3">
+              <div className="text-[11px] text-slate-500">情绪分布</div>
+              <div className="mt-2 grid grid-cols-3 gap-2 text-xs text-slate-600">
+                <div className="rounded-xl border border-emerald-100 bg-emerald-50 px-2 py-1">
+                  <div className="text-[11px] text-emerald-600">利好</div>
+                  <div className="text-sm font-semibold text-emerald-700">{bullishNews.length}</div>
+                </div>
+                <div className="rounded-xl border border-slate-200 bg-slate-50 px-2 py-1">
+                  <div className="text-[11px] text-slate-600">中性</div>
+                  <div className="text-sm font-semibold text-slate-700">{neutralNews.length}</div>
+                </div>
+                <div className="rounded-xl border border-rose-100 bg-rose-50 px-2 py-1">
+                  <div className="text-[11px] text-rose-600">利空</div>
+                  <div className="text-sm font-semibold text-rose-700">{bearishNews.length}</div>
+                </div>
+              </div>
+              <div className="mt-2 text-[11px] text-slate-500">共 {displayedTimelineCount} 条，按时间排序</div>
+            </div>
+            <div className="rounded-2xl border border-slate-100 bg-white px-3 py-3">
+              <div className="text-[11px] text-slate-500">过滤与数据质量</div>
+              <div className="mt-2 text-xs text-slate-600 space-y-1">
+                <div>过滤跳过：{signalsMeta?.skipped_irrelevant ?? 0}</div>
+                <div>回填记录：{signalsMeta?.added_from_skipped ?? 0}</div>
+                <div>使用宽松过滤：{signalsMeta?.used_loose_filter ? '是' : '否'}</div>
+              </div>
+              <div className="mt-2 text-[11px] text-slate-500">
+                拉新参数：最近 {newsDays} 天 · 每次 {newsSize} 条
               </div>
             </div>
           </div>
 
-          <div className="timeline-scroll mt-4 flex-1 pr-3 max-h-[520px] lg:max-h-[640px] overflow-y-auto">
+          <div className="flex flex-wrap items-center gap-3">
+            {sentimentOptions.map((option) => {
+              const isActive = sentimentFilter === option.key
+              return (
+                <button
+                  key={option.key}
+                  type="button"
+                  onClick={() => setSentimentFilter(option.key)}
+                  className={`px-3 py-1.5 text-xs rounded-full border transition ${isActive ? option.activeClass : option.baseClass}`}
+                >
+                  {option.label}
+                  <span className="ml-1 text-[11px] opacity-70">{option.count}</span>
+                </button>
+              )
+            })}
+            <span className="text-xs text-slate-400">共 {displayedTimelineCount} 条</span>
+            <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500 ml-auto">
+              <label htmlFor="news-days" className="text-slate-500">
+                刷新时间范围：
+              </label>
+              <select
+                id="news-days"
+                className="rounded-full border border-slate-200 px-2 py-1 text-slate-700"
+                value={newsDays}
+                onChange={(e) => setNewsDays(Number(e.target.value))}
+              >
+                {newsDaysOptions.map((d) => (
+                  <option key={d} value={d}>
+                    最近 {d} 天
+                  </option>
+                ))}
+              </select>
+              <label htmlFor="news-size" className="text-slate-500">
+                每次拉取：
+              </label>
+              <select
+                id="news-size"
+                className="rounded-full border border-slate-200 px-2 py-1 text-slate-700"
+                value={newsSize}
+                onChange={(e) => setNewsSize(Number(e.target.value))}
+              >
+                {newsSizeOptions.map((size) => (
+                  <option key={size} value={size}>
+                    {size} 条
+                  </option>
+                ))}
+              </select>
+              {signalModuleState.loading && timelineNews.length > 0 && <span className="text-amber-600">更新中...</span>}
+              {signalModuleState.error && timelineNews.length > 0 && (
+                <button type="button" onClick={() => onReloadModule?.('signals')} className="text-rose-500 hover:underline">
+                  重新加载
+                </button>
+              )}
+              <span className="text-[11px] text-slate-500">待分析 {pendingCount} 条</span>
+            </div>
+          </div>
+
+          <div className="timeline-scroll mt-2 flex-1 pr-3 max-h-[520px] lg:max-h-[640px] overflow-y-auto min-w-0">
             {signalModuleState.loading && !timelineNews.length ? (
               <ModuleInlineStatus message="正在拉取基本面资讯..." />
             ) : signalModuleState.error && !timelineNews.length ? (
@@ -2170,11 +3328,13 @@ const timelineGroups = useMemo<TimelineGroup[]>(() => {
                         const tags = analysis.themes || []
                         const providerKey = (analysis.analysis_provider || '').toString().toLowerCase()
                         const providerMeta = analysisProviderMeta[providerKey]
+                        const isPending = providerKey === 'pending' || (!analysis.sentiment && !analysis.analysis_provider)
+                        const cardClasses = isPending ? 'opacity-80' : ''
                         const key = `${item.url}-${index}`
                         return (
                           <li key={key} className="relative pl-6">
                             <span className={`absolute -left-[7px] top-6 h-3 w-3 rounded-full border-2 border-white shadow ${style.dot}`} />
-                            <div className={`rounded-2xl border border-slate-100 bg-white/90 p-4 transition ${style.border}`}>
+                            <div className={`rounded-2xl border border-slate-100 bg-white/90 p-4 transition ${style.border} ${cardClasses}`}>
                               <div className="flex flex-wrap items-center justify-between gap-3 text-xs text-slate-500">
                                 <div className="flex flex-wrap items-center gap-2">
                                   <span className={`px-2 py-0.5 rounded-full text-[11px] font-medium ${style.badge}`}>
@@ -2198,14 +3358,26 @@ const timelineGroups = useMemo<TimelineGroup[]>(() => {
                                   </span>
                                 )}
                               </div>
-                              <a
-                                href={item.url}
-                                className="mt-2 block text-sm font-semibold text-slate-900 hover:text-blue-600"
-                                target="_blank"
-                                rel="noreferrer"
-                              >
-                                {item.title || '未命名资讯'}
-                              </a>
+                              <div className="flex items-start gap-2">
+                                <a
+                                  href={item.url}
+                                  className="mt-2 block text-sm font-semibold text-slate-900 hover:text-blue-600"
+                                  target="_blank"
+                                  rel="noreferrer"
+                                >
+                                  {item.title || '未命名资讯'}
+                                </a>
+                                {isPending && (
+                                  <button
+                                    type="button"
+                                    className="ml-auto mt-1 text-[11px] px-2 py-1 rounded-full border border-blue-200 text-blue-600 hover:bg-blue-50"
+                                    onClick={() => onAnalyzeNow?.(item)}
+                                    title="立即触发分析"
+                                  >
+                                    触发分析
+                                  </button>
+                                )}
+                              </div>
                               {summary && <p className="text-xs text-slate-500 mt-1 leading-relaxed">{summary}</p>}
                               {hint && <p className="text-xs text-slate-400 mt-1">建议：{hint}</p>}
                               {tags.length > 0 && (
@@ -2233,7 +3405,7 @@ const timelineGroups = useMemo<TimelineGroup[]>(() => {
           </div>
         </section>
 
-        <aside className="space-y-4 self-stretch">
+        <aside className="space-y-4 self-stretch min-w-[280px]">
           {capitalModuleState.error && !flowSummary && !distributionSummary && (
             <ModuleInlineStatus
               variant="error"
@@ -2257,6 +3429,51 @@ const timelineGroups = useMemo<TimelineGroup[]>(() => {
               </dl>
             ) : (
               <p className="text-sm text-slate-500">暂无持仓记录</p>
+            )}
+          </div>
+
+              <div className="rounded-2xl border border-slate-200 bg-white p-5 space-y-3">
+            <div className="flex items-center justify-between">
+              <h4 className="text-sm font-semibold text-slate-900">基础面报告（最新）</h4>
+              <a
+                className="text-xs text-blue-600 hover:underline"
+                href={`/fundamental?code=${data.code}`}
+                onClick={(e) => {
+                  if (onNavigate) {
+                    e.preventDefault()
+                    onNavigate(`/fundamental?code=${data.code}`)
+                  }
+                }}
+              >
+                更多
+              </a>
+            </div>
+            {reportListLoading ? (
+              <div className="text-xs text-slate-500">加载中...</div>
+            ) : latestReports.length === 0 ? (
+              <div className="text-xs text-slate-400">暂无报告，点击生成日报/周报</div>
+            ) : (
+              <div className="space-y-2">
+                {latestReports.map((item) => (
+                  <a
+                    key={item.id}
+                    className="block rounded-xl border border-slate-200 p-3 hover:border-blue-200"
+                    href={`/fundamental-report?id=${item.id}`}
+                    onClick={(e) => {
+                      if (onNavigate) {
+                        e.preventDefault()
+                        onNavigate(`/fundamental-report?id=${item.id}`)
+                      }
+                    }}
+                  >
+                    <div className="flex items-center justify-between text-xs text-slate-500">
+                      <div className="font-semibold text-slate-900 truncate mr-2">{item.title || `${item.code} ${item.date}`}</div>
+                      <span>{item.date}</span>
+                    </div>
+                    <p className="text-[11px] text-slate-500 mt-1 line-clamp-3">{item.report}</p>
+                  </a>
+                ))}
+              </div>
             )}
           </div>
 

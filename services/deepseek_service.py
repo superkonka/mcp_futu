@@ -14,6 +14,7 @@ class DeepSeekService:
         base_url: str = "https://api.deepseek.com/v1/chat/completions",
         model: str = "deepseek-v3.2",
         fundamental_model: str = "deepseek-v3.2",
+        reasoner_model: str = "deepseek-reasoner",
         max_tokens: int = 2048,
     ):
         self.api_key = api_key
@@ -21,6 +22,7 @@ class DeepSeekService:
         self.base_url = f"{base_url.rstrip('/')}/chat/completions" if not base_url.endswith("/chat/completions") else base_url
         self.model = model or "deepseek-v3.2"
         self.fundamental_model = fundamental_model or self.model
+        self.reasoner_model = reasoner_model or "deepseek-reasoner"
         self.timeout = aiohttp.ClientTimeout(total=60)
         self.max_retries = 2
         self.max_tokens = max_tokens
@@ -116,13 +118,14 @@ class DeepSeekService:
                 "deepseek-v3.2-speciale",
                 "deepseek-v3.2",
                 "deepseek-chat",
+                self.reasoner_model,
             ]
         else:
             model_candidates = [
                 effective_model,
                 "deepseek-v3.2",
                 "deepseek-chat",
-                "deepseek-reasoner",
+                self.reasoner_model,
             ]
         # 去重且保持顺序
         seen_models = set()
@@ -191,7 +194,7 @@ class DeepSeekService:
                                     model_candidates = [
                                         "deepseek-v3.2",
                                         "deepseek-chat",
-                                        "deepseek-reasoner",
+                                        self.reasoner_model,
                                     ]
                                     seen_models = set()
                                     model_candidates = [
@@ -205,6 +208,14 @@ class DeepSeekService:
                         else:
                             data = json.loads(text)
                             self.last_error_message = None
+                            preview = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                            if preview:
+                                logger.debug(
+                                    f"[DeepSeek] 响应 success model={effective_model} len={len(preview)} "
+                                    f"preview={preview[:160]!r}"
+                                )
+                            else:
+                                logger.debug(f"[DeepSeek] 响应 success model={effective_model} (无内容)")
                             return data.get("choices", [{}])[0].get("message", {}).get("content", "")
             except asyncio.TimeoutError as exc:
                 last_error = exc

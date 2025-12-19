@@ -37,6 +37,8 @@ from config import settings
 # 导入新功能模块  
 from cache.cache_manager import DataCacheManager, CacheConfig
 from analysis.technical_indicators import TechnicalIndicators, TechnicalData, IndicatorConfig
+from models.fundamental_models import FundamentalSearchRequest
+from app.models.analysis import TechnicalAnalysisRequest, IndicatorType
 # 导入基本面搜索服务
 from services.fundamental_service import fundamental_service
 from models.fundamental_models import FundamentalSearchRequest, FundamentalSearchResponse
@@ -98,13 +100,19 @@ async def lifespan(app: FastAPI):
             # 如果使用 Speciale base_url 且未指定模型，自动使用 special 模型名
             base_url = settings.deepseek_base_url or "https://api.deepseek.com/v1/chat/completions"
             is_speciale = "speciale" in (base_url or "").lower()
-            default_model = "deepseek-v3.2-speciale" if is_speciale else "deepseek-v3.2"
+            default_model = "deepseek-v3.2-speciale" if is_speciale else "deepseek-chat"
             default_fundamental_model = default_model
+            reasoner_model = (
+                settings.deepseek_reasoner_model
+                or getattr(settings, "deepseek_reaspmer_model", None)
+                or "deepseek-reasoner"
+            )
             deepseek_service = DeepSeekService(
                 settings.deepseek_api_key,
                 base_url=base_url,
                 model=settings.deepseek_model or default_model,
                 fundamental_model=settings.deepseek_fundamental_model or default_fundamental_model,
+                reasoner_model=reasoner_model,
             )
             logger.info("✅ DeepSeek分析服务已启用")
         else:
@@ -422,6 +430,31 @@ class FundamentalNewsRefreshRequest(BaseModel):
     code: str = Field(..., description="股票代码, 如 HK.00700")
     size: int = Field(10, ge=10, le=100, description="Metaso 搜索数量")
     days: int = Field(3, ge=1, le=30, description="限定最近N天的资讯，默认3天")
+    stock_name: Optional[str] = Field(None, description="股票名称（可选，优先用于搜索关键词）")
+
+class FundamentalNewsListRequest(BaseModel):
+    code: Optional[str] = Field(None, description="股票代码")
+    status: Optional[str] = Field(None, description="pending/fail/done")
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+    limit: int = Field(50, ge=1, le=200)
+    offset: int = Field(0, ge=0)
+
+class FundamentalReportListRequest(BaseModel):
+    code: str = Field(..., description="股票代码, 如 HK.00700")
+    period: Optional[str] = Field(None, description="daily/weekly")
+    limit: int = Field(20, ge=1, le=100)
+    offset: int = Field(0, ge=0)
+
+class FundamentalReportChatRequest(BaseModel):
+    report_id: int
+    question: str
+    ref_ids: Optional[List[str]] = Field(None, description="可选，引用点ID列表（与报告meta.references中的ref_id/unique_key匹配）")
+    references: Optional[List[Dict[str, Any]]] = Field(None, description="可选，直接传递的引用点内容")
+
+class CustomFundamentalNewsSearchRequest(BaseModel):
+    q: str = Field(..., description="自定义搜索关键词")
+    size: int = Field(10, ge=1, le=50, description="返回数量，默认10，最多50")
 
 
 @app.post("/api/analysis/multi_model",
@@ -850,13 +883,22 @@ async def _fetch_holding_snapshot(code: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-async def _fetch_news_signals(code: str, size: int = 12, refresh: bool = True, days: int = 3) -> Dict[str, List[Dict[str, Any]]]:
+async def _fetch_news_signals(
+    code: str,
+    size: int = 12,
+    refresh: bool = True,
+    days: int = 3,
+    stock_name: Optional[str] = None,
+) -> Dict[str, List[Dict[str, Any]]]:
     signals = {"bullish": [], "bearish": [], "neutral": [], "sector_news": [], "macro_news": []}
     run_remote = refresh and fundamental_service.is_configured()
     days = max(1, min(int(days or 3), 30))
     now_utc = datetime.now(timezone.utc)
-    cutoff_dt = now_utc - timedelta(days=days)
-    max_dt = now_utc + timedelta(days=1)  # 防止未来日期污染
+    # 仅用于查询关键词的时间范围提示，不再用于过滤入库结果
+    cutoff_dt = None
+    max_dt = None
+    refreshed_direct_records: List[Dict[str, Any]] = []
+    inline_analysis = False  # 先入库，分析放后台重算
 
     def _normalize_publish_time(value: Optional[Any]) -> Optional[str]:
         if value is None:
@@ -930,9 +972,13 @@ async def _fetch_news_signals(code: str, size: int = 12, refresh: bool = True, d
         return None
 
 
+    company_name = (stock_name or "").strip()
+
     async def _build_search_query() -> str:
+        nonlocal company_name
         def _ensure_recent(q: str) -> str:
             text = q.lower()
+            today_token = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             recency_token = f"最近{days}天"
             recent_tokens = [
                 "最近", "本周", "过去", "近一周", "last 7 days", "past week", "today", "yesterday", "last week",
@@ -940,18 +986,17 @@ async def _fetch_news_signals(code: str, size: int = 12, refresh: bool = True, d
             ]
             if any(tok.lower() in text for tok in recent_tokens):
                 return q
-            return f"{q} {recency_token}"
+            return f"{q} {recency_token} {today_token}"
 
-        default_query = _ensure_recent(f"{code} 最新 股票新闻 基本面")
-        if not run_remote or not deepseek_service or not deepseek_service.is_configured():
-            return default_query
-        company_name = code
         try:
             quote_info = await _fetch_quote_snapshot(code)
             if quote_info and quote_info.get("name"):
                 company_name = str(quote_info["name"])
         except Exception:
             company_name = code
+        default_query = _ensure_recent(f"{company_name} 财报 业绩 政策 业务 基本面 最新")
+        if not run_remote or not deepseek_service or not deepseek_service.is_configured():
+            return default_query
         prompt = (
             "你是金融情报检索专家。请基于股票代码和公司名称，提供一个用于新闻搜索的简短中文关键词，"
             "聚焦基本面、财报、政策或竞争情报，不超过18个汉字。"
@@ -982,14 +1027,45 @@ async def _fetch_news_signals(code: str, size: int = 12, refresh: bool = True, d
         tokens.update({base.replace(".", ""), base.replace(".", " ")})
         return [token for token in tokens if token]
 
-    code_tokens = _build_code_tokens(code)
-    search_query = await _build_search_query()
+    def _build_name_tokens(name: str) -> List[str]:
+        if not name:
+            return []
+        raw = name.strip()
+        tokens = {raw, raw.replace(" ", ""), raw.replace("-", ""), raw.replace("_", "")}
+        # 按常见分隔符拆分
+        parts = re.split(r"[，,。；;、\s\/\-]+", raw)
+        for part in parts:
+            part = part.strip()
+            if len(part) >= 2:
+                tokens.add(part)
+        # 针对带有括号/后缀的情况，保留主要部分
+        if "(" in raw and ")" in raw:
+            try:
+                tokens.add(raw.split("(", 1)[0])
+            except Exception:
+                pass
+        return [t for t in tokens if t]
 
-    def _has_code_token(record: Dict[str, Any]) -> bool:
+    code_tokens = _build_code_tokens(code)
+    name_tokens = _build_name_tokens(company_name or "")
+    target_tokens = list({tok.upper() for tok in code_tokens} | {tok.upper() for tok in name_tokens})
+    search_query = await _build_search_query()
+    logger.info(
+        "[fundamental.search.query] code=%s name=%s query=%s tokens=%s",
+        code,
+        company_name or "-",
+        search_query,
+        target_tokens,
+    )
+
+    def _has_target_token(record: Dict[str, Any]) -> bool:
+        # 如果没有公司名 tokens，则不过滤（仅代码），避免过度丢弃
+        if not name_tokens:
+            return True
         title = (record.get("title") or "").upper()
         snippet = (record.get("snippet") or "").upper()
         merged = f"{title} {snippet}"
-        return any(token and token in merged for token in code_tokens)
+        return any(token and token in merged for token in target_tokens)
 
     def _classify_scope(record: Dict[str, Any], analysis: Optional[Dict[str, Any]]) -> str:
         # 优先：如果当前请求的 code 与记录的 code 一致，直接视为 direct，防止被误判为 sector/macro
@@ -1000,17 +1076,17 @@ async def _fetch_news_signals(code: str, size: int = 12, refresh: bool = True, d
             if isinstance(scope, str):
                 scope_lower = scope.lower()
                 if scope_lower in {"direct", "sector", "macro"}:
-                    if scope_lower == "direct" and not _has_code_token(record):
+                    if scope_lower == "direct" and not _has_target_token(record):
                         return "sector"
                     return scope_lower
             related_val = analysis.get("related")
             if isinstance(related_val, bool):
-                if related_val and _has_code_token(record):
+                if related_val and _has_target_token(record):
                     return "direct"
                 if related_val:
                     return "sector"
                 return "macro"
-        if _has_code_token(record):
+        if _has_target_token(record):
             return "direct"
         return "macro"
 
@@ -1021,7 +1097,7 @@ async def _fetch_news_signals(code: str, size: int = 12, refresh: bool = True, d
             sentiment = "bearish"
         elif any(key.lower() in lowered for key in BULLISH_KEYWORDS):
             sentiment = "bullish"
-        scope = "direct" if any(token.lower() in lowered for token in code_tokens) else "macro"
+        scope = "direct" if any(token.lower() in lowered for token in target_tokens) else "macro"
         return {
             "sentiment": sentiment,
             "confidence": 0.4,
@@ -1103,23 +1179,15 @@ async def _fetch_news_signals(code: str, size: int = 12, refresh: bool = True, d
         updated_count = 0
         skipped_no_time = 0
         skipped_cutoff = 0
+        new_items_log: List[Tuple[str, str]] = []
+        updated_items_log: List[Tuple[str, str]] = []
+        cutoff_items_log: List[Tuple[str, str]] = []
+        notime_items_log: List[str] = []
         max_items = min(len(results), size)
+        refreshed_direct_records: List[Dict[str, Any]] = []
         for item in results[:max_items]:
             raw_publish_time = item.publish_time
             normalized_publish_time = _normalize_publish_time(raw_publish_time)
-            if cutoff_dt:
-                if not normalized_publish_time:
-                    # 缺失或无法解析发布时间，跳过，避免时间轴被旧数据污染
-                    skipped_no_time += 1
-                    continue
-                try:
-                    dt = datetime.fromisoformat(normalized_publish_time.replace("Z", "+00:00"))
-                    if dt < cutoff_dt or dt > max_dt:
-                        skipped_cutoff += 1
-                        continue
-                except Exception:
-                    skipped_no_time += 1
-                    continue
             record = {
                 "code": code,
                 "title": item.title,
@@ -1141,7 +1209,11 @@ async def _fetch_news_signals(code: str, size: int = 12, refresh: bool = True, d
                 stored = fundamental_storage.get_by_unique_key(unique_key)
             analysis = stored.get("analysis") if stored and stored.get("analysis") else None
             if not analysis:
-                analysis = await _ensure_analysis(record)
+                if inline_analysis:
+                    analysis = await _ensure_analysis(record)
+                else:
+                    # 延迟分析，先入库
+                    analysis = {"analysis_provider": "pending", "needs_reanalysis": 1}
             scope = _classify_scope(record, analysis)
             if scope != "direct":
                 logger.info(
@@ -1154,22 +1226,37 @@ async def _fetch_news_signals(code: str, size: int = 12, refresh: bool = True, d
                 fundamental_storage.upsert(record)
                 if existed:
                     updated_count += 1
+                    if len(updated_items_log) < 3:
+                        updated_items_log.append((record.get("title") or "", record.get("publish_time") or ""))
                 else:
                     new_count += 1
+                    if len(new_items_log) < 3:
+                        new_items_log.append((record.get("title") or "", record.get("publish_time") or ""))
+                if scope == "direct":
+                    refreshed_direct_records.append(record)
             kept_count += 1
         logger.info(
             f"[fundamental.refresh] code={code} fetched={fetched_count} kept={kept_count} "
             f"new={new_count} updated={updated_count} "
             f"skip_no_time={skipped_no_time} skip_cutoff={skipped_cutoff} days={days}"
         )
+        if new_items_log:
+            logger.info("[fundamental.refresh.new_samples] %s", new_items_log)
+        if updated_items_log:
+            logger.info("[fundamental.refresh.updated_samples] %s", updated_items_log)
+        if cutoff_items_log:
+            logger.info("[fundamental.refresh.skip_cutoff_samples] %s", cutoff_items_log)
+        if notime_items_log:
+            logger.info("[fundamental.refresh.skip_no_time_samples] %s", notime_items_log)
     except Exception as exc:
         logger.debug(f"基本面增量搜索失败: {exc}")
 
     if run_remote:
         refresh_quota = max(3, min(10, max(size // 2, 1)))
-        await _repair_existing_records(quota=refresh_quota)
+        # 后台触发重算，避免阻塞刷新
+        asyncio.create_task(_repair_existing_records(quota=refresh_quota))
 
-    def _build_cached_news_signals() -> Dict[str, List[Dict[str, Any]]]:
+    def _build_cached_news_signals(override_direct_records: Optional[List[Dict[str, Any]]] = None) -> Dict[str, List[Dict[str, Any]]]:
         local_signals = {key: [] for key in signals.keys()}
         stored_records: List[Dict[str, Any]] = []
         sector_records: List[Dict[str, Any]] = []
@@ -1184,20 +1271,89 @@ async def _fetch_news_signals(code: str, size: int = 12, refresh: bool = True, d
             except Exception:
                 return datetime.min
 
+        seen_keys = set()
+        # 先放入本次刷新得到的direct记录
+        if override_direct_records:
+            for rec in override_direct_records:
+                key = rec.get("unique_key")
+                if not key and fundamental_storage:
+                    key = fundamental_storage.make_unique_key(
+                        rec.get("code", ""),
+                        rec.get("title", ""),
+                        rec.get("url", ""),
+                        rec.get("publish_time") or rec.get("raw_publish_time"),
+                    )
+                    rec["unique_key"] = key
+                if key and key in seen_keys:
+                    continue
+                if key:
+                    seen_keys.add(key)
+                stored_records.append(rec)
+
+        skipped_irrelevant = 0
+        def _is_relevant(rec: Dict[str, Any]) -> bool:
+            # 标题/摘要包含目标关键词才认为相关
+            return _has_target_token(rec)
+
+        skipped_recs: List[Dict[str, Any]] = []
         if fundamental_storage:
-            raw_records = fundamental_storage.get_recent_news(code, limit=40)
-            # 按发布时间降序排序，避免字符串排序导致新数据被埋
+            raw_records = fundamental_storage.get_recent_news(code, limit=100)
             raw_records_sorted = sorted(raw_records, key=_sort_key_by_time, reverse=True)
-            for rec in raw_records_sorted:
+            recent_keep = 10  # 保底保留最新若干条，防止过度过滤
+            for idx, rec in enumerate(raw_records_sorted):
                 if rec.get("code") and rec.get("code") != code:
+                    continue
+                key = rec.get("unique_key")
+                if key and key in seen_keys:
+                    continue
+                if not _is_relevant(rec) and idx >= recent_keep:
+                    skipped_irrelevant += 1
+                    skipped_recs.append(rec)
                     continue
                 scope = _classify_scope(rec, rec.get("analysis"))
                 if scope == "direct":
+                    if key:
+                        seen_keys.add(key)
                     stored_records.append(rec)
                 elif scope == "sector":
                     sector_records.append(rec)
                 else:
                     macro_records.append(rec)
+        added_from_skipped = 0
+        min_keep = 8
+        if (not stored_records or len(stored_records) < min_keep) and skipped_recs:
+            # 如果过滤后过少，补充被跳过的记录（按时间排序）以免列表过瘠
+            logger.info(f"[fundamental.signals.cache] code={code} direct过少({len(stored_records)}), 回填被过滤的记录")
+            for rec in skipped_recs:
+                if len(stored_records) >= min_keep:
+                    break
+                key = rec.get("unique_key")
+                if key and key in seen_keys:
+                    continue
+                scope = _classify_scope(rec, rec.get("analysis"))
+                if scope != "direct":
+                    continue
+                if key:
+                    seen_keys.add(key)
+                stored_records.append(rec)
+                added_from_skipped += 1
+
+        if not stored_records and skipped_irrelevant > 0:
+            logger.info(f"[fundamental.signals.cache] code={code} direct为空，放宽过滤纳入被跳过的记录")
+            stored_records = []
+            seen_keys = set()
+            for rec in raw_records_sorted if fundamental_storage else []:
+                if rec.get("code") and rec.get("code") != code:
+                    continue
+                key = rec.get("unique_key")
+                if key and key in seen_keys:
+                    continue
+                scope = _classify_scope(rec, rec.get("analysis"))
+                if scope == "direct":
+                    if key:
+                        seen_keys.add(key)
+                    stored_records.append(rec)
+
         if not stored_records:
             logger.info(f"[fundamental.signals.cache] code={code} 本地无direct资讯，sector={len(sector_records)} macro={len(macro_records)}")
             local_signals["daily_metrics"] = []
@@ -1286,15 +1442,80 @@ async def _fetch_news_signals(code: str, size: int = 12, refresh: bool = True, d
             }
             for rec in macro_records
         ]
+        local_signals["meta"] = {
+            "search_query": search_query,
+            "company_name": company_name,
+            "skipped_irrelevant": skipped_irrelevant,
+            "added_from_skipped": added_from_skipped,
+            "total_direct": len(stored_records),
+            "used_loose_filter": (not name_tokens) or (added_from_skipped > 0) or (not stored_records)
+        }
+        local_signals["summary"] = _build_fundamental_summary(local_signals)
         logger.info(
             f"[fundamental.signals.cache] code={code} bullish={len(local_signals.get('bullish', []))} "
             f"bearish={len(local_signals.get('bearish', []))} total_direct={len(stored_records)} "
             f"sector={len(sector_records)} macro={len(macro_records)} "
-            f"top_publish_time={preview_times}"
+            f"top_publish_time={preview_times} skipped_irrelevant={skipped_irrelevant} "
+            f"added_from_skipped={added_from_skipped}"
         )
         return local_signals
 
-    return _build_cached_news_signals()
+    return _build_cached_news_signals(
+        override_direct_records=refreshed_direct_records if run_remote else None
+    )
+
+
+def _build_fundamental_summary(signals: Dict[str, List[Dict[str, Any]]], limit: int = 12) -> Dict[str, Any]:
+    """从已分析的资讯构建一个短摘要，供多模型前置/前端展示"""
+    def _parse_ts(text: Any) -> float:
+        if text is None:
+            return 0.0
+        try:
+            if isinstance(text, (int, float)):
+                val = float(text)
+                return val if val > 1e12 else val
+            s = str(text).strip()
+            if not s:
+                return 0.0
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            dt = datetime.fromisoformat(s)
+            return dt.timestamp()
+        except Exception:
+            return 0.0
+
+    all_items: List[Dict[str, Any]] = []
+    for key in ("bullish", "bearish", "neutral"):
+        for item in signals.get(key, []):
+            i = dict(item)
+            i["sentiment"] = key
+            all_items.append(i)
+    def _ts(item: Dict[str, Any]) -> float:
+        return _parse_ts(item.get("publish_time") or item.get("published_at") or item.get("last_seen"))
+    sorted_items = sorted(all_items, key=_ts, reverse=True)
+    top_items = sorted_items[:limit]
+    counts = {
+        "bullish": len(signals.get("bullish", [])),
+        "bearish": len(signals.get("bearish", [])),
+        "neutral": len(signals.get("neutral", [])),
+    }
+    latest_ts = _ts(top_items[0]) if top_items else None
+    headlines = []
+    for item in top_items:
+        headlines.append({
+            "title": item.get("title"),
+            "sentiment": item.get("sentiment"),
+            "publish_time": item.get("publish_time") or item.get("published_at"),
+            "source": item.get("source"),
+            "url": item.get("url"),
+            "summary": (item.get("analysis") or {}).get("summary") or item.get("snippet")
+        })
+    return {
+        "counts": counts,
+        "latest_time": datetime.fromtimestamp(latest_ts, tz=timezone.utc).isoformat() if latest_ts else None,
+        "headlines": headlines,
+        "limit": limit,
+    }
 
 def _normalize_kline_cache_scope(request: HistoryKLineRequest) -> Tuple[str, str, str]:
     """生成用于缓存的K线范围标识，避免不同请求互相污染"""
@@ -2483,11 +2704,10 @@ async def get_dashboard_bootstrap(session: str, modules: Optional[str] = None) -
         return asyncio.create_task(asyncio.sleep(0, result=result))
 
     tasks: Dict[str, asyncio.Task] = {}
-    if "core" in module_set:
+    if "core" in module_set or "signals" in module_set:
         tasks["quote"] = asyncio.create_task(_fetch_quote_snapshot(code))
+    if "core" in module_set:
         tasks["holding"] = asyncio.create_task(_fetch_holding_snapshot(code))
-    if "signals" in module_set:
-        tasks["signals"] = asyncio.create_task(_fetch_news_signals(code, 12, refresh=False))
     if "recommendations" in module_set:
         tasks["recommendations"] = asyncio.create_task(_fetch_recommendations_snapshot(code))
     if "capital" in module_set:
@@ -2561,8 +2781,18 @@ async def get_dashboard_bootstrap(session: str, modules: Optional[str] = None) -
             bootstrap["holding"] = holding
         bootstrap["session_window"] = session_window
 
-    if "signals" in module_set and "signals" in tasks:
-        signals_result = _task_result("signals")
+    if "signals" in module_set:
+        # 需要公司名以便关键词过滤，本地信号不再乱跳
+        stock_name = data.get("nickname")
+        quote_for_signals = tasks.get("quote")
+        if quote_for_signals and not quote_for_signals.cancelled():
+            try:
+                quote_val = quote_for_signals.result()
+                if quote_val and quote_val.get("name"):
+                    stock_name = quote_val.get("name")
+            except Exception:
+                pass
+        signals_result = await _fetch_news_signals(code, 12, refresh=False, stock_name=stock_name)
         if signals_result is not None:
             bootstrap["signals"] = signals_result
 
@@ -2942,11 +3172,462 @@ async def refresh_fundamental_news(request: FundamentalNewsRefreshRequest) -> AP
     if not fundamental_service.is_configured():
         return APIResponse(ret_code=-1, ret_msg="Metaso API 密钥未配置，无法使用基本面搜索功能", data=None)
     try:
-        signals = await _fetch_news_signals(request.code, request.size, days=request.days)
+        start_ts = time.time()
+        logger.info(
+            "[fundamental.refresh.start] code=%s size=%s days=%s",
+            request.code,
+            request.size,
+            request.days,
+        )
+        signals = await _fetch_news_signals(
+            request.code,
+            request.size,
+            days=request.days,
+            stock_name=request.stock_name,
+        )
+        elapsed = time.time() - start_ts
+        bull_len = len(signals.get("bullish", [])) if signals else 0
+        bear_len = len(signals.get("bearish", [])) if signals else 0
+        neutral_len = len(signals.get("neutral", [])) if signals else 0
+        logger.info(
+            "[fundamental.refresh.done] code=%s size=%s days=%s cost=%.3fs bullish=%s bearish=%s neutral=%s",
+            request.code,
+            request.size,
+            request.days,
+            elapsed,
+            bull_len,
+            bear_len,
+            neutral_len,
+        )
         return APIResponse(ret_code=0, ret_msg="刷新成功", data={"signals": signals})
     except Exception as e:
         logger.error(f"刷新基本面资讯失败: {e}")
         return APIResponse(ret_code=-1, ret_msg=f"刷新基本面资讯失败: {e}", data=None)
+
+
+@app.get("/api/fundamental/summary",
+         operation_id="get_fundamental_summary",
+         summary="获取本地基本面汇总",
+         description="从本地缓存的资讯中构建简要汇总，不触发外部搜索")
+async def get_fundamental_summary(code: str, limit: int = 12) -> APIResponse:
+    if not _server_ready:
+        return APIResponse(ret_code=-1, ret_msg="服务器正在初始化中，请稍后重试", data=None)
+    if not fundamental_service.is_configured():
+        return APIResponse(ret_code=-1, ret_msg="Metaso API 密钥未配置，无法使用基本面功能", data=None)
+    try:
+        signals = await _fetch_news_signals(code, size=limit, refresh=False)
+        summary = (signals or {}).get("summary") or {}
+        return APIResponse(ret_code=0, ret_msg="ok", data={"summary": summary})
+    except Exception as exc:
+        logger.error(f"获取基本面汇总失败: {exc}")
+        return APIResponse(ret_code=-1, ret_msg=f"获取基本面汇总失败: {exc}", data=None)
+
+
+@app.post("/api/fundamental/reports",
+          operation_id="list_fundamental_reports",
+          summary="列出基本面报告",
+          description="按代码/period分页读取已生成的基本面报告")
+async def list_fundamental_reports(request: FundamentalReportListRequest) -> APIResponse:
+    if not _server_ready:
+        return APIResponse(ret_code=-1, ret_msg="服务器正在初始化中，请稍后重试", data=None)
+    if not fundamental_storage:
+        return APIResponse(ret_code=-1, ret_msg="本地存储不可用", data=None)
+    try:
+        reports = fundamental_storage.list_reports(request.code, period=request.period, limit=request.limit, offset=request.offset)
+        return APIResponse(ret_code=0, ret_msg="ok", data={"items": reports})
+    except Exception as exc:
+        logger.error(f"列出基本面报告失败: {exc}")
+        return APIResponse(ret_code=-1, ret_msg=f"列出基本面报告失败: {exc}", data=None)
+
+
+@app.post("/api/fundamental/news/search_custom",
+          operation_id="search_fundamental_news_custom",
+          summary="自定义关键词新闻搜索（Metaso直查）",
+          description="用户输入关键词直接调用Metaso搜索，不使用股票代码拼接")
+async def search_fundamental_news_custom(request: CustomFundamentalNewsSearchRequest) -> APIResponse:
+    if not _server_ready:
+        return APIResponse(ret_code=-1, ret_msg="服务器正在初始化中，请稍后重试", data=None)
+    if not fundamental_service.is_configured():
+        return APIResponse(ret_code=-1, ret_msg="Metaso API 未配置", data=None)
+    try:
+        fs_req = FundamentalSearchRequest(
+            q=request.q,
+            scope="webpage",
+            includeSummary=True,
+            size=request.size,
+            includeRawContent=False,
+            conciseSnippet=True
+        )
+        resp = await fundamental_service.search_fundamental_info(fs_req)
+        return APIResponse(ret_code=0, ret_msg="ok", data=resp.dict())
+    except Exception as exc:
+        logger.error(f"自定义新闻搜索失败: {exc}")
+        return APIResponse(ret_code=-1, ret_msg=f"搜索失败: {exc}", data=None)
+
+
+@app.get("/api/fundamental/report/{report_id}",
+         operation_id="get_fundamental_report",
+         summary="获取单条基础面报告详情")
+async def get_fundamental_report(report_id: int) -> APIResponse:
+    if not _server_ready:
+        return APIResponse(ret_code=-1, ret_msg="服务器正在初始化中，请稍后重试", data=None)
+    if not fundamental_storage:
+        return APIResponse(ret_code=-1, ret_msg="本地存储不可用", data=None)
+    try:
+        report = fundamental_storage.get_report_by_id(report_id)
+        if not report:
+            return APIResponse(ret_code=-1, ret_msg="报告不存在", data=None)
+        meta = report.get("meta") or {}
+        refs = meta.get("references") or []
+        has_tech = any((ref.get("source") or "") == "technical" for ref in refs)
+        if not refs:
+            refs = []
+        if not refs:
+            # 旧数据兜底：按报告 days/size_limit 重新从本地库构造引用点，避免前端无可选引用
+            try:
+                days = int(report.get("days") or 3)
+                limit = int(report.get("size_limit") or 30)
+                records = fundamental_storage.get_news_since(report.get("code", ""), days=days, limit=limit)
+                for idx, rec in enumerate(records):
+                    analysis = rec.get("analysis") or {}
+                    title = rec.get("title") or "未命名资讯"
+                    sentiment = analysis.get("sentiment") or rec.get("sentiment") or "中性"
+                    summary = analysis.get("summary") or rec.get("snippet") or ""
+                    date = rec.get("publish_time") or rec.get("published_at") or rec.get("last_seen") or ""
+                    ref_id = rec.get("unique_key") or rec.get("url") or f"ref-{idx+1}"
+                    refs.append({
+                        "id": idx + 1,
+                        "ref_id": ref_id,
+                        "unique_key": rec.get("unique_key"),
+                        "title": title,
+                        "publish_time": date,
+                        "source": rec.get("source"),
+                        "url": rec.get("url"),
+                        "sentiment": sentiment,
+                        "summary": summary,
+                    })
+            except Exception as _build_exc:
+                logger.warning(f"报告引用构造失败: { _build_exc }")
+        if not has_tech:
+            try:
+                tech_req = TechnicalAnalysisRequest(
+                    code=report.get("code", ""),
+                    indicators=[IndicatorType.MACD, IndicatorType.RSI, IndicatorType.MA],
+                    ktype="K_DAY",
+                    period=180
+                )
+                tech_resp = await get_technical_indicators(tech_req)
+                if isinstance(tech_resp, dict) and tech_resp.get("ret_code") == 0:
+                    tdata = tech_resp.get("data") or {}
+                    summary = tdata.get("summary") or tdata.get("overall_view") or tdata.get("signal_summary")
+                    if not summary:
+                        signals = tdata.get("signals") or {}
+                        if signals:
+                            summary = "; ".join(f"{k}:{v}" for k, v in signals.items())
+                    if summary:
+                        refs.append({
+                            "id": "tech-summary",
+                            "ref_id": "technical-summary",
+                            "title": "技术面摘要",
+                            "publish_time": datetime.now(timezone.utc).isoformat(),
+                            "source": "technical",
+                            "sentiment": "技术",
+                            "summary": summary,
+                        })
+            except Exception as tech_exc:
+                logger.warning(f"报告引用构造技术面失败: {tech_exc}")
+        meta["references"] = refs
+        report["meta"] = meta
+        return APIResponse(ret_code=0, ret_msg="ok", data={"report": report})
+    except Exception as exc:
+        logger.error(f"获取报告失败: {exc}")
+        return APIResponse(ret_code=-1, ret_msg=f"获取报告失败: {exc}", data=None)
+
+
+@app.post("/api/fundamental/report/chat",
+          operation_id="chat_with_fundamental_report",
+          summary="基于基础面报告进行对话",
+          description="将报告正文作为上下文，使用 DeepSeek 回答附加问题")
+async def chat_with_fundamental_report(request: FundamentalReportChatRequest) -> APIResponse:
+    if not _server_ready:
+        return APIResponse(ret_code=-1, ret_msg="服务器正在初始化中，请稍后重试", data=None)
+    if not deepseek_service or not deepseek_service.is_configured():
+        return APIResponse(ret_code=-1, ret_msg="DeepSeek 未配置，无法对话", data=None)
+    if not fundamental_storage:
+        return APIResponse(ret_code=-1, ret_msg="本地存储不可用", data=None)
+    try:
+        report = fundamental_storage.get_report_by_id(request.report_id)
+        if not report:
+            return APIResponse(ret_code=-1, ret_msg="报告不存在", data=None)
+        selected_refs: List[Dict[str, Any]] = []
+        report_meta = report.get("meta") or {}
+        meta_refs = report_meta.get("references") or []
+        if request.references:
+            selected_refs = request.references[:8]
+        elif request.ref_ids:
+            ref_id_set = set([str(rid) for rid in request.ref_ids])
+            for r in meta_refs:
+                rid = str(r.get("ref_id") or r.get("unique_key") or r.get("id") or "")
+                if rid and rid in ref_id_set:
+                    selected_refs.append(r)
+            selected_refs = selected_refs[:8]
+        # 构造上下文
+        system_prompt = (
+            "你是一名研究员，基于提供的基础面报告回答追加问题。保持简洁，直接引用报告要点，不要虚构。"
+        )
+        extra_context = ""
+        if selected_refs:
+            lines = []
+            for idx, ref in enumerate(selected_refs):
+                title = ref.get("title") or "未命名资讯"
+                date = ref.get("publish_time") or ref.get("published_at") or ref.get("last_seen") or ""
+                source = ref.get("source") or ""
+                summary = ref.get("summary") or ""
+                sentiment = ref.get("sentiment") or ""
+                lines.append(f"{idx+1}. [{date}] {source} {sentiment} 标题:{title} 摘要:{summary}")
+            extra_context = "附加上下文（选中的引用点）：\n" + "\n".join(lines)
+
+        user_prompt = f"报告摘要:\n{report.get('report')}\n\n{extra_context}\n\n问题: {request.question}\n请用中文回答，条理清晰，限制在300字以内。"
+        reply = await deepseek_service.chat(system_prompt, user_prompt, temperature=0.2)
+        if not reply:
+            return APIResponse(ret_code=-1, ret_msg="DeepSeek 未返回内容", data=None)
+        return APIResponse(ret_code=0, ret_msg="ok", data={"answer": reply.strip()})
+    except Exception as exc:
+        logger.error(f"报告对话失败: {exc}")
+        return APIResponse(ret_code=-1, ret_msg=f"报告对话失败: {exc}", data=None)
+
+
+@app.post("/api/fundamental/report",
+          operation_id="build_fundamental_report",
+          summary="对最近N天的资讯做DeepSeek汇总，生成基本面报告",
+          description="读取本地缓存资讯，按天数过滤后汇总，调用DeepSeek生成摘要报告，避免逐条分析过长token")
+async def build_fundamental_report(request: Dict[str, Any]) -> APIResponse:
+    if not _server_ready:
+        return APIResponse(ret_code=-1, ret_msg="服务器正在初始化中，请稍后重试", data=None)
+    if not deepseek_service or not deepseek_service.is_configured():
+        return APIResponse(ret_code=-1, ret_msg="DeepSeek 未配置，无法生成报告", data=None)
+    if not fundamental_storage:
+        return APIResponse(ret_code=-1, ret_msg="本地存储不可用", data=None)
+    code = request.get("code") or ""
+    stock_name = request.get("stock_name") or ""
+    period = (request.get("period") or "daily").lower()
+    date_str = request.get("date")
+    days = int(request.get("days") or (7 if period == "weekly" else 3))
+    limit = int(request.get("limit") or 30)
+    source = request.get("source") or "manual"
+    if not date_str:
+        today = datetime.now(timezone.utc).date()
+        if period == "weekly":
+            monday = today - timedelta(days=today.weekday())
+            date_str = monday.isoformat()
+        else:
+            date_str = today.isoformat()
+    try:
+        records = fundamental_storage.get_news_since(code, days=days, limit=limit)
+        if not records:
+            return APIResponse(ret_code=-1, ret_msg="无可用资讯用于汇总", data=None)
+        references = []
+        tech_reference = None
+        try:
+            tech_req = TechnicalAnalysisRequest(
+                code=code,
+                indicators=[IndicatorType.MACD, IndicatorType.RSI, IndicatorType.MA],
+                ktype="K_DAY",
+                period=180
+            )
+            tech_resp = await get_technical_indicators(tech_req)
+            if isinstance(tech_resp, dict) and tech_resp.get("ret_code") == 0:
+                tdata = tech_resp.get("data") or {}
+                summary = tdata.get("summary") or tdata.get("overall_view") or tdata.get("signal_summary")
+                if not summary:
+                    signals = tdata.get("signals") or {}
+                    if signals:
+                        summary = "; ".join(f"{k}:{v}" for k, v in signals.items())
+                if summary:
+                    tech_reference = {
+                        "id": "tech-summary",
+                        "ref_id": "technical-summary",
+                        "title": "技术面摘要",
+                        "publish_time": datetime.now(timezone.utc).isoformat(),
+                        "source": "technical",
+                        "sentiment": "技术",
+                        "summary": summary,
+                    }
+        except Exception as tech_exc:
+            logger.warning(f"构造技术面引用失败: {tech_exc}")
+        lines = []
+        for idx, rec in enumerate(records):
+            analysis = rec.get("analysis") or {}
+            title = rec.get("title") or "未命名资讯"
+            sentiment = analysis.get("sentiment") or rec.get("sentiment") or "中性"
+            summary = analysis.get("summary") or rec.get("snippet") or ""
+            date = rec.get("publish_time") or rec.get("published_at") or rec.get("last_seen") or ""
+            ref_id = rec.get("unique_key") or rec.get("url") or f"ref-{idx+1}"
+            references.append({
+                "id": idx + 1,
+                "ref_id": ref_id,
+                "unique_key": rec.get("unique_key"),
+                "title": title,
+                "publish_time": date,
+                "source": rec.get("source"),
+                "url": rec.get("url"),
+                "sentiment": sentiment,
+                "summary": summary,
+            })
+            lines.append(f"{idx+1}. [{date}] 情绪:{sentiment} 标题:{title} 来源:{rec.get('source') or ''} 摘要:{summary}")
+        user_prompt = (
+            f"请基于以下{len(lines)}条资讯（近{days}天内，本地缓存，已按时间排序），生成一份不超过500字的基本面摘要报告，"
+            "需包含：整体情绪、核心利好/利空因素、风险提示、时间敏感点，最后给一个一句话结论。"
+            "只输出报告正文，不要JSON，不要逐条重复全文。\n\n"
+            + "\n".join(lines)
+        )
+        system_prompt = "你是资深卖方分析师，擅长压缩资讯为简短要点，避免冗长重复。"
+        content = await deepseek_service.chat(system_prompt, user_prompt, temperature=0.2)
+        if not content:
+            return APIResponse(ret_code=-1, ret_msg="DeepSeek 未返回内容", data=None)
+        report_text = content.strip()
+        response_references = references + ([tech_reference] if tech_reference else [])
+        # 存库
+        try:
+            meta = {
+                "counts": len(lines),
+                "days": days,
+                "limit": limit,
+                "source": source,
+                "references": response_references,
+            }
+            fundamental_storage.upsert_report({
+                "code": code,
+                "stock_name": stock_name,
+                "period": period,
+                "date": date_str,
+                "title": f"{code} {date_str} { '周报' if period == 'weekly' else '日报'}",
+                "report": report_text,
+                "items_used": len(lines),
+                "days": days,
+                "size_limit": limit,
+                "source": source,
+                "meta": meta,
+            })
+        except Exception as store_exc:
+            logger.warning(f"报告存储失败: {store_exc}")
+        return APIResponse(
+            ret_code=0,
+            ret_msg="ok",
+            data={
+                "report": report_text,
+                "items_used": len(lines),
+                "days": days,
+                "limit": limit,
+                "period": period,
+                "date": date_str,
+                "references": response_references,
+            },
+        )
+    except Exception as exc:
+        logger.error(f"生成基本面报告失败: {exc}")
+        return APIResponse(ret_code=-1, ret_msg=f"生成基本面报告失败: {exc}", data=None)
+
+
+@app.post("/api/fundamental/news/list",
+          operation_id="list_fundamental_news",
+          summary="列出本地已存的基本面资讯",
+          description="仅访问本地DB，支持状态/日期过滤，不访问外部搜索")
+async def list_fundamental_news(request: FundamentalNewsListRequest) -> APIResponse:
+    if not _server_ready:
+        return APIResponse(ret_code=-1, ret_msg="服务器正在初始化中，请稍后重试", data=None)
+    if not fundamental_storage:
+        return APIResponse(ret_code=-1, ret_msg="本地存储不可用", data=None)
+    try:
+        items = fundamental_storage.list_news(
+            code=request.code,
+            status=request.status,
+            start_date=request.start_date,
+            end_date=request.end_date,
+            limit=request.limit,
+            offset=request.offset,
+        )
+        return APIResponse(ret_code=0, ret_msg="ok", data={"items": items})
+    except Exception as exc:
+        logger.error(f"列出基本面资讯失败: {exc}")
+        return APIResponse(ret_code=-1, ret_msg=f"列出基本面资讯失败: {exc}", data=None)
+
+
+@app.post("/api/fundamental/analyze_now",
+          operation_id="analyze_fundamental_now",
+          summary="触发单条资讯即时分析",
+          description="对指定资讯立即调用 DeepSeek 分析并更新入库")
+async def analyze_fundamental_now(request: dict) -> APIResponse:
+    if not _server_ready:
+        return APIResponse(ret_code=-1, ret_msg="服务器正在初始化中，请稍后重试", data=None)
+    if not deepseek_service or not deepseek_service.is_configured():
+        return APIResponse(ret_code=-1, ret_msg="DeepSeek 未配置，无法分析", data=None)
+    if not fundamental_storage:
+        return APIResponse(ret_code=-1, ret_msg="本地存储不可用", data=None)
+    code = request.get("code") or ""
+    title = request.get("title") or ""
+    url = request.get("url") or ""
+    publish_time = request.get("publish_time") or request.get("published_at")
+    payload = {
+        "code": code,
+        "title": title,
+        "url": url,
+        "source": request.get("source"),
+        "snippet": request.get("snippet"),
+        "publish_time": publish_time,
+    }
+    try:
+        analysis = await deepseek_service.analyze_fundamental_news(payload)
+        if analysis is None:
+            # 视为失败并入库标记，便于前端看到“分析失败/待重试”
+            unique_key = fundamental_storage.make_unique_key(code, title, url, publish_time)
+            fail_record = {
+                "code": code,
+                "title": title,
+                "url": url,
+                "snippet": request.get("snippet"),
+                "publish_time": publish_time,
+                "analysis": {
+                    "analysis_provider": "fail",
+                    "analysis_error": deepseek_service.last_error_message or "未返回结果",
+                    "sentiment": request.get("sentiment"),
+                },
+                "unique_key": unique_key,
+                "needs_reanalysis": 1,
+            }
+            fundamental_storage.upsert(fail_record)
+            return APIResponse(ret_code=-1, ret_msg=deepseek_service.last_error_message or "分析失败，未返回结果", data=None)
+        analysis["analysis_provider"] = "deepseek"
+        unique_key = fundamental_storage.make_unique_key(code, title, url, publish_time)
+        stored = fundamental_storage.get_by_unique_key(unique_key) or {}
+        record = {**stored, **payload, "analysis": analysis, "unique_key": unique_key}
+        record["needs_reanalysis"] = 0
+        fundamental_storage.upsert(record)
+        logger.info("[fundamental.analyze_now] code=%s title=%s provider=deepseek", code, title)
+        return APIResponse(ret_code=0, ret_msg="分析完成", data={"analysis": analysis})
+    except Exception as exc:
+        logger.error(f"即时分析失败: {exc}")
+        # 标记为失败，后续可重试
+        try:
+            unique_key = fundamental_storage.make_unique_key(code, title, url, publish_time)
+            record = {
+                "code": code,
+                "title": title,
+                "url": url,
+                "snippet": request.get("snippet"),
+                "publish_time": publish_time,
+                "analysis": {
+                    "analysis_provider": "fail",
+                    "analysis_error": str(exc),
+                    "sentiment": request.get("sentiment"),
+                },
+                "unique_key": unique_key,
+                "needs_reanalysis": 1,
+            }
+            fundamental_storage.upsert(record)
+        except Exception:
+            pass
+        return APIResponse(ret_code=-1, ret_msg=f"分析失败: {exc}", data=None)
 
 
 @app.post("/api/fundamental/read_webpage",

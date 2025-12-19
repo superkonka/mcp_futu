@@ -5,6 +5,7 @@ from collections import defaultdict
 from typing import Dict, Any, Optional, TYPE_CHECKING
 from datetime import datetime
 import time
+import os
 
 import futu as ft
 import pandas as pd
@@ -56,6 +57,7 @@ class DashboardStreamManager:
 
     def __init__(self, futu_service, loop: asyncio.AbstractEventLoop, kline_storage: Optional["MinuteKlineStorage"] = None):
         self.futu_service = futu_service
+        self.debug_stream = os.getenv("DASHBOARD_STREAM_DEBUG", "false").lower() == "true"
         self.loop = loop
         self.quote_ctx = getattr(futu_service, "quote_ctx", None)
         self.subtypes = [
@@ -340,7 +342,7 @@ class DashboardStreamManager:
             message = dict(payload)
             message["code"] = code
             self.loop.call_soon_threadsafe(self._queue_put, queue, message)
-            if should_log:
+            if should_log and self.debug_stream:
                 logger.debug(
                     "[dashboard.stream.broadcast] code={} session={} payload_keys={} queue_size={}",
                     code,
@@ -371,13 +373,14 @@ class DashboardStreamManager:
         price = payload.get("price")
         change = payload.get("change_rate")
         ts = payload.get("update_time")
-        logger.debug(
-            "[dashboard.stream.quote] code={} price={} change_rate={} update_time={}",
-            code,
-            price,
-            change,
-            ts,
-        )
+        if self.debug_stream:
+            logger.debug(
+                "[dashboard.stream.quote] code={} price={} change_rate={} update_time={}",
+                code,
+                price,
+                change,
+                ts,
+            )
 
     @staticmethod
     def _is_same_payload(previous: Any, current: Any, kind: str) -> bool:
