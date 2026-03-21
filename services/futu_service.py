@@ -1831,7 +1831,16 @@ class FutuService:
                 paginated_stocks = filtered_stocks[begin_index:end_index]
                 
             except Exception as api_error:
-                # 如果API调用失败，返回模拟数据
+                # 严格模式：不返回模拟数据，直接报错
+                if os.environ.get('DISABLE_MOCK_DATA', 'false').lower() == 'true':
+                    logger.error(f"API调用失败且模拟数据已禁用: {str(api_error)}")
+                    return APIResponse(
+                        ret_code=-1,
+                        ret_msg=f"无法获取真实数据: {str(api_error)}",
+                        data=None
+                    )
+                
+                # 非严格模式：如果API调用失败，返回模拟数据（保留原有逻辑）
                 logger.warning(f"API调用失败，返回模拟数据: {str(api_error)}")
                 
                 # 根据市场返回模拟数据

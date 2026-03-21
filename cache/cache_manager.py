@@ -28,6 +28,14 @@ class CacheConfig:
     memory_max_size: int = 1000  # 内存缓存最大条目数
     redis_expire_seconds: int = 3600  # Redis缓存过期时间
     enable_compression: bool = True
+    enabled: bool = True  # 全局启用/禁用缓存
+    
+    def __post_init__(self):
+        # 从环境变量读取缓存配置
+        import os
+        if os.environ.get('CACHE_ENABLED', 'true').lower() == 'false':
+            self.enabled = False
+            logger.info("缓存已通过环境变量 CACHE_ENABLED=false 禁用")
 
 
 class DataCacheManager:
@@ -153,6 +161,11 @@ class DataCacheManager:
     
     async def get_kline_data(self, code: str, ktype: str, start: str, end: str) -> Optional[List[Dict]]:
         """智能获取K线数据"""
+        # 严格模式：缓存禁用时直接返回 None
+        if not self.config.enabled:
+            logger.debug(f"缓存已禁用，跳过 K 线缓存查询: {code}")
+            return None
+            
         cache_key = self._generate_cache_key("kline", code=code, ktype=ktype, start=start, end=end)
         
         # 1. 检查内存缓存
@@ -194,6 +207,11 @@ class DataCacheManager:
     
     async def get_quote_data(self, codes: List[str]) -> Optional[List[Dict]]:
         """获取报价数据"""
+        # 严格模式：缓存禁用时直接返回 None
+        if not self.config.enabled:
+            logger.debug(f"缓存已禁用，跳过报价缓存查询: {codes}")
+            return None
+            
         cache_key = self._generate_cache_key("quote", codes="|".join(sorted(codes)))
         
         # 检查内存缓存（报价数据时效性要求高，主要使用内存和Redis）
@@ -222,6 +240,11 @@ class DataCacheManager:
     
     async def get_indicator_data(self, indicator_type: str, code: str, params: Dict) -> Optional[Dict]:
         """获取技术指标数据"""
+        # 严格模式：缓存禁用时直接返回 None
+        if not self.config.enabled:
+            logger.debug(f"缓存已禁用，跳过指标缓存查询: {indicator_type} {code}")
+            return None
+            
         normalized_params = self._normalize_indicator_params(params)
         cache_key = self._generate_cache_key("indicator", type=indicator_type, code=code, **normalized_params)
         
