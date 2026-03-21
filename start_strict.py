@@ -16,17 +16,17 @@ os.environ['PYTHONUNBUFFERED'] = '1'
 os.environ['PYTHONIOENCODING'] = 'utf-8'
 
 print("="*60)
-print("  富途 MCP 服务 - 严格模式")
+print("  Futu MCP Service - Strict Mode")
 print("="*60)
 print()
-print("严格模式已启用：")
-print("  ✓ 禁用模拟数据")
-print("  ✓ 禁用缓存")
-print("  ✓ 强制真实环境")
-print("  ✓ 禁用降级处理")
+print("Strict mode enabled:")
+print("  - Disable mock data")
+print("  - Disable cache")
+print("  - Force real environment")
+print("  - Disable fallback")
 print()
-print("所有数据将直接来自富途 OpenD")
-print("如果 OpenD 连接失败，API 将返回错误而不是假数据")
+print("All data will come from Futu OpenD")
+print("If OpenD fails, API will return error instead of fake data")
 print()
 
 # 导入并启动主服务
