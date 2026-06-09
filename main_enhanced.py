@@ -38,7 +38,7 @@ from config import settings
 from cache.cache_manager import DataCacheManager, CacheConfig
 from analysis.technical_indicators import TechnicalIndicators, TechnicalData, IndicatorConfig
 from models.fundamental_models import FundamentalSearchRequest
-from app.models.analysis import TechnicalAnalysisRequest, IndicatorType
+from models.fundamental_models import FundamentalSearchRequest
 # 导入基本面搜索服务
 from services.fundamental_service import fundamental_service
 from models.fundamental_models import FundamentalSearchRequest, FundamentalSearchResponse
