@@ -53,7 +53,10 @@ python restart.py
 # 🔥 手动启动增强版MCP服务 - 端口8001
 python main_enhanced.py
 
-# 🎯 简化版HTTP服务（稳定）- 端口8002  
+# 🔒 严格模式启动（禁用模拟数据/缓存/降级）- 端口8001
+python start_strict.py
+
+# 🎯 简化版HTTP备用服务 - 端口8002  
 python main_enhanced_simple_alternative.py
 
 # 5. (可选) 启动独立 MCP 包装服务 - 端口9001
@@ -716,16 +719,38 @@ sudo systemctl status futu-mcp
 
 ### **服务版本选择指南**
 
-| 版本 | 端口 | 特性 | 适用场景 | 稳定性 |
-|------|------|------|----------|--------|
-| **main_enhanced.py** | 8001 | MCP + HTTP双协议 | AI助手集成 | 95% ⚠️ |
-| **main_enhanced_simple_alternative.py** | 8002 | 纯HTTP API | 生产环境 | 100% ✅ |
-| **main_simple.py** | 8000 | 基础功能 | 轻量使用 | 100% ✅ |
+| 版本 | 端口 | 特性 | 适用场景 |
+|------|------|------|----------|
+| **main_enhanced.py** | 8001 | 主服务（HTTP API + 看板 + 基本面） | 日常使用 / AI 助手集成 |
+| **start_strict.py** | 8001 | 严格模式：禁用模拟数据/缓存/降级 | 对数据真实性要求高的场景 |
+| **main_enhanced_simple_alternative.py** | 8002 | 纯 HTTP 备用服务 | 应急备用 |
+| **mcp_service/main.py** | 9001 | MCP 协议包装（代理到 8001） | MCP 客户端接入 |
 
 **推荐选择:**
-- 🔥 **生产环境**: `main_enhanced_simple_alternative.py` (端口8002)
-- 🤖 **AI集成**: `main_enhanced.py` (端口8001) + HTTP API备选
-- ⚡ **轻量场景**: `main_simple.py` (端口8000)
+- 🌟 **默认**: `main_enhanced.py`（或 `python restart.py` 智能重启）
+- 🔒 **严格数据**: `start_strict.py`（OpenD 连不上就报错，绝不返回模拟数据，详见 `STRICT_MODE.md`）
+- 🤖 **MCP 客户端**: 先起 8001，再启 `mcp_service/main.py`（端口 9001）
+
+> 📦 历史版本（`main.py`、`main_simple.py`、`main_enhanced_mcp_fixed.py`、2025-12 的 `app/` 重构线及旧文档/测试）已归档至 `archive/` 目录，仅作历史参考，不再维护。
+
+### **项目结构（当前）**
+
+```
+main_enhanced.py        # 主入口：FastAPI app + lifespan + 系统路由（约270行）
+web_api/
+├── shared.py           # 共享层：导入、全局状态、请求模型、辅助函数
+└── routes/             # 按业务域拆分的路由模块
+    ├── analysis.py     #   综合快照 / 多模型分析 / 技术指标
+    ├── quote.py        #   行情：K线、报价、资金流、板块、实时增强
+    ├── trade.py        #   交易：账户、持仓、订单、成交
+    ├── dashboard.py    #   MCP 实时看板（会话/bootstrap/SSE）
+    ├── recommendations.py  # 策略建议记录与再评估
+    ├── fundamental.py  #   基本面资讯/研报
+    └── system.py       #   时间、缓存管理、行情权限
+services/  analysis/  models/  cache/  utils/   # 业务支撑层
+mcp_service/main.py     # MCP 协议独立包装服务（9001）
+archive/                # 历史遗留代码与文档（不维护）
+```
 
 ---
 
